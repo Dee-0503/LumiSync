@@ -82,3 +82,21 @@ label, then remove the Helper launch daemon and privileged executable.
   token. As a local structural check,
   `brew style ./Casks/lumisync.rb` passed with no offenses and `ruby -c`
   reported `Syntax OK`.
+
+## Task 10 final verification on 2026-08-04
+
+- `swift test`: **FAIL** (exit `1`). Swift 6.2.3 compiled the package sources,
+  but the test target failed with `no such module 'XCTest'`. The active
+  developer directory is `/Library/Developer/CommandLineTools`,
+  `xcrun --find xctest` exits `72`, and full Xcode is absent, so this machine
+  cannot run the XCTest suite. The `macos-14` CI runner is configured to run
+  the same command with its Xcode toolchain.
+- `swift run lumisync`: **PASS** (exit `0`). The executable built and printed
+  `LumiSync 0.1.0`.
+- `bash Scripts/package-release.sh`: **EXPECTED BLOCKED** (exit `1`). The
+  script reported all four missing prerequisites: Xcode at
+  `/Applications/Xcode.app`, a Developer ID Application signing identity, the
+  signed `build/Release/LumiSync.app` artifact, and `NOTARYTOOL_PROFILE`.
+- `brew audit --cask --new ./Casks/lumisync.rb`: **BLOCKED** (exit `1`).
+  Homebrew rejected the path argument with
+  `Calling brew audit [path ...] is disabled! Use brew audit [name ...] instead.`
