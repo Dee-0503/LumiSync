@@ -10,14 +10,9 @@ Read-only probe passed on 2026-08-14 with:
 - Swift 6.2.1
 
 The probe discovered one built-in keyboard backlight (`id=95158272`) and read its
-normalized brightness as `0.0000`. No write was performed during development or
-verification because recovery behavior was validated with a fake backend, but
-termination-time recovery cannot be proven safe enough for an unattended real
-hardware test: POSIX signal handlers cannot safely invoke Objective-C/private
-framework code.
+normalized brightness as `0.0000`. No real write was performed.
 
-Current gate status: **read passes; real write remains blocked pending an
-out-of-process recovery watchdog or equivalent crash-safe mechanism.**
+Current gate status: **read passes; real write remains blocked.**
 
 ## Prototype
 
@@ -31,26 +26,48 @@ The default mode loads the private framework at runtime, enumerates keyboard
 backlight IDs, checks whether each device is built in, and reads its brightness.
 It does not call a setter.
 
-A write-test path is implemented behind the library boundary, but the CLI keeps
-all real writes blocked until crash-safe out-of-process recovery exists. Even both
-explicit flags fail closed:
+The CLI requires both explicit write confirmations, but still fails closed:
 
 ```sh
 swift run lumisync-keyboard-probe --unsafe-write-test --confirm-restore
 ```
 
 The command exits with `Real writes are blocked until out-of-process recovery is
-implemented.` The library flow reads the original value first, installs recovery,
-writes `0.0`, `0.5`, and `1.0` with readback checks, then restores the original
-value. Fake-backend unit tests prove ordering, error-path restoration, refusal to
-write without recovery, and keeping recovery armed after a failed restore. They
-do not prove restoration after `SIGKILL`, a process crash, power loss, or an unsafe
-signal callback, so the hardware setter is not reachable from the prototype CLI.
+implemented.` The library now separates a child writer protocol from a parent
+recovery watchdog. Fake-backend tests cover the `0.0`, `0.5`, and `1.0` writer
+sequence, readback mismatch, normal child completion, thrown child-launch errors,
+`SIGINT`, `SIGTERM`, crash, kill, `SIGKILL`, restore failure, and restore-readback
+verification.
+
+## Watchdog blocker
+
+A first POSIX child-process runner was intentionally removed after its integration
+tests left shell children behind and could hang beyond the five-second test budget.
+The fake protocol proves the parent recovery policy, but it does not prove that the
+real process runner always forwards termination, bounds `waitpid`, and reaps the
+writer without orphaning descendants. Therefore the safety gate is not met and the
+hardware setter remains unreachable from the CLI.
+
+Before enabling real writes, add a deterministic process harness with all of these
+properties:
+
+- every external-process test has a hard deadline below five seconds;
+- timeout cleanup kills the complete writer process group and reaps it;
+- normal exit, Swift throw, `SIGINT`, `SIGTERM`, crash, explicit kill, and `SIGKILL`
+  are exercised without orphan processes;
+- the parent independently owns keyboard ID and original brightness;
+- the parent restores and reads back the original brightness after every child
+  outcome;
+- any restore or verification uncertainty fails closed.
+
+Only after that harness passes the filtered and full test suites may the reference
+machine set `0.0`, `0.5`, and `1.0`, verify every readback, and confirm the final
+value equals the captured original value.
 
 ## API research
 
-No public Apple SDK API was found for third-party control of the built-in
-keyboard backlight. The working path on this machine is the private framework:
+No public Apple SDK API was found for third-party control of the built-in keyboard
+backlight. The working read path on this machine is the private framework:
 
 - Framework: `/System/Library/PrivateFrameworks/CoreBrightness.framework`
 - Objective-C class: `KeyboardBrightnessClient`
@@ -72,41 +89,20 @@ the on-disk framework binary symlink appears broken to ordinary filesystem tools
 while `Bundle.load()` and runtime class lookup succeed. Static linking or assuming
 a physical Mach-O at the symlink is therefore inappropriate.
 
-The legacy Intel-era `AppleLMUController` IORegistry service was not present.
-The built-in keyboard appears as `AppleHIDKeyboardEventDriverV2`, but its public
+The legacy Intel-era `AppleLMUController` IORegistry service was not present. The
+built-in keyboard appears as `AppleHIDKeyboardEventDriverV2`, but its public
 IORegistry properties do not expose a supported normalized keyboard-backlight
-setter. Direct IOKit user-client reverse engineering was not needed for the
-read-only prototype and would increase compatibility and privilege risk.
+setter.
 
 ## Permissions and platform risk
 
-On this reference machine, the read-only private API worked as an ordinary
-unsigned SwiftPM executable:
-
-- no root access;
-- no TCC prompt;
-- no special entitlement;
-- no SIP change;
-- no access to key events, key contents, screen contents, or user files.
+On this reference machine, the read-only private API worked as an ordinary unsigned
+SwiftPM executable with no root access, TCC prompt, special entitlement, or SIP
+change. It does not access key events, key contents, screen contents, or user files.
 
 The private API has no source or binary compatibility guarantee. Class names,
-selectors, type encodings, keyboard ID semantics, return conventions, access
-checks, and daemon behavior may change in any macOS update. Private framework use
-is unsuitable for Mac App Store distribution and may be rejected during review.
-Hardened Runtime, sandboxing, notarization, or future entitlement checks may also
-change whether runtime loading or writes are accepted. SIP must not be disabled,
-and undocumented Apple entitlements must not be requested or forged.
-
-## Required next step before real writes
-
-Implement a minimal out-of-process recovery watchdog before executing the hardware
-write test. The parent should hold the original value and monitor a short-lived
-writer; if the writer exits, crashes, or is terminated before reporting successful
-restoration, the parent must restore the original brightness independently. The
-watchdog itself must be tested against normal completion, thrown errors, `SIGINT`,
-`SIGTERM`, and forced writer termination. `SIGKILL`, kernel failure, and power loss
-remain unavoidable residual risks and must be documented in the operator prompt.
-
-Only after that mechanism passes should the reference-machine test set `0.0`,
-`0.5`, and `1.0`, verify each readback, and confirm the final value equals the
-captured original value.
+selectors, type encodings, keyboard ID semantics, return conventions, access checks,
+and daemon behavior may change in any macOS update. Private framework use is
+unsuitable for Mac App Store distribution and may be rejected during review. SIP
+must not be disabled, and undocumented Apple entitlements must not be requested or
+forged.

@@ -35,19 +35,7 @@ do {
             )
         }
     case .writeTest:
-        guard builtInKeyboards.count == 1, let keyboard = builtInKeyboards.first else {
-            fail("write test requires exactly one built-in keyboard backlight")
-        }
-
-        print("mode=unsafe-write-test")
-        print("keyboard=\(keyboard.id)")
-        print("original=\(format(keyboard.brightness))")
-        print("recovery=installing SIGINT/SIGTERM/SIGHUP + atexit handlers")
-        let result = try KeyboardBacklightWriteTest(backend: backend).run(
-            keyboardID: keyboard.id
-        )
-        print("verified=\(result.verifiedLevels.map(format).joined(separator: ","))")
-        print("restored=\(format(result.originalBrightness))")
+        fail("write test is unreachable until the watchdog gate passes")
     }
 } catch {
     fail(String(describing: error))

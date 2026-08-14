@@ -1,3 +1,4 @@
+import Darwin
 import XCTest
 @testable import LumiSyncKeyboardProbe
 
@@ -13,75 +14,156 @@ final class KeyboardBacklightSafetyTests: XCTestCase {
         XCTAssertEqual(backend.operations, [.list, .isBuiltIn(42), .read(42)])
     }
 
-    func testWriteTestVisitsRequiredLevelsThenRestoresOriginal() throws {
+    func testWriterVisitsRequiredLevelsAndVerifiesReadbacks() throws {
         let backend = RecordingKeyboardBacklightBackend(
             originalBrightness: 0.37,
-            readbacks: [0.37, 0.0, 0.5, 1.0]
+            readbacks: [0.0, 0.5, 1.0]
         )
-        let runner = KeyboardBacklightWriteTest(backend: backend)
 
-        let result = try runner.run(keyboardID: 42)
+        let result = try KeyboardBacklightWriter(backend: backend).run(keyboardID: 42)
 
-        XCTAssertEqual(result.originalBrightness, 0.37)
         XCTAssertEqual(result.verifiedLevels, [0.0, 0.5, 1.0])
         XCTAssertEqual(backend.operations, [
-            .read(42),
-            .installRecovery(42, 0.37),
             .write(42, 0.0), .read(42),
             .write(42, 0.5), .read(42),
-            .write(42, 1.0), .read(42),
-            .restore(42, 0.37),
-            .disarmRecovery
+            .write(42, 1.0), .read(42)
         ])
     }
 
-    func testWriteFailureRestoresOriginalBeforeRethrowing() {
+    func testWriterFailsOnReadbackMismatch() {
         let backend = RecordingKeyboardBacklightBackend(
             originalBrightness: 0.37,
-            failure: .write(42, 0.5)
+            readbacks: [0.0, 0.4]
         )
-        let runner = KeyboardBacklightWriteTest(backend: backend)
 
-        XCTAssertThrowsError(try runner.run(keyboardID: 42))
-        XCTAssertEqual(backend.operations.suffix(2), [
-            .restore(42, 0.37),
-            .disarmRecovery
+        XCTAssertThrowsError(try KeyboardBacklightWriter(backend: backend).run(keyboardID: 42))
+        XCTAssertEqual(backend.operations, [
+            .write(42, 0.0), .read(42),
+            .write(42, 0.5), .read(42)
         ])
     }
 
-    func testWriteTestRefusesNonFiniteOriginalBeforeRecoveryOrWrite() {
-        let backend = RecordingKeyboardBacklightBackend(originalBrightness: .nan)
-        let runner = KeyboardBacklightWriteTest(backend: backend)
+    func testWatchdogOwnsOriginalAndRestoresAfterNormalCompletion() throws {
+        let backend = RecordingKeyboardBacklightBackend(
+            originalBrightness: 0.37,
+            readbacks: [0.37, 0.37]
+        )
+        let child = RecordingChildRunner(termination: .exited(0))
 
-        XCTAssertThrowsError(try runner.run(keyboardID: 42))
+        let result = try KeyboardBacklightRecoveryWatchdog(
+            backend: backend,
+            childRunner: child
+        ).run(keyboardID: 42)
+
+        XCTAssertEqual(result.originalBrightness, 0.37)
+        XCTAssertEqual(child.keyboardIDs, [42])
+        XCTAssertEqual(backend.operations, [
+            .read(42),
+            .restore(42, 0.37),
+            .read(42)
+        ])
+    }
+
+    func testWatchdogRestoresForEveryAbnormalChildTermination() {
+        let terminations: [KeyboardBacklightChildTermination] = [
+            .exited(70),
+            .signaled(SIGINT),
+            .signaled(SIGTERM),
+            .signaled(SIGABRT),
+            .signaled(SIGKILL)
+        ]
+
+        for termination in terminations {
+            let backend = RecordingKeyboardBacklightBackend(
+                originalBrightness: 0.37,
+                readbacks: [0.37, 0.37]
+            )
+            let child = RecordingChildRunner(termination: termination)
+
+            XCTAssertThrowsError(
+                try KeyboardBacklightRecoveryWatchdog(
+                    backend: backend,
+                    childRunner: child
+                ).run(keyboardID: 42),
+                "termination=\(termination)"
+            )
+            XCTAssertEqual(backend.operations.suffix(2), [
+                .restore(42, 0.37),
+                .read(42)
+            ])
+        }
+    }
+
+    func testWatchdogRestoresWhenChildLaunchThrows() {
+        let backend = RecordingKeyboardBacklightBackend(
+            originalBrightness: 0.37,
+            readbacks: [0.37, 0.37]
+        )
+        let child = RecordingChildRunner(error: TestError.requested)
+
+        XCTAssertThrowsError(
+            try KeyboardBacklightRecoveryWatchdog(
+                backend: backend,
+                childRunner: child
+            ).run(keyboardID: 42)
+        )
+        XCTAssertEqual(backend.operations.suffix(2), [
+            .restore(42, 0.37),
+            .read(42)
+        ])
+    }
+
+    func testWatchdogRefusesToLaunchForInvalidOriginalBrightness() {
+        let backend = RecordingKeyboardBacklightBackend(originalBrightness: .nan)
+        let child = RecordingChildRunner(termination: .exited(0))
+
+        XCTAssertThrowsError(
+            try KeyboardBacklightRecoveryWatchdog(
+                backend: backend,
+                childRunner: child
+            ).run(keyboardID: 42)
+        )
+        XCTAssertTrue(child.keyboardIDs.isEmpty)
         XCTAssertEqual(backend.operations, [.read(42)])
     }
 
-    func testWriteTestRefusesToWriteWhenRecoveryCannotBeInstalled() {
+    func testWatchdogFailsClosedWhenRestorationCannotBeVerified() {
         let backend = RecordingKeyboardBacklightBackend(
             originalBrightness: 0.37,
-            failure: .installRecovery(42, 0.37)
+            readbacks: [0.37, 0.25]
         )
-        let runner = KeyboardBacklightWriteTest(backend: backend)
+        let child = RecordingChildRunner(termination: .exited(0))
 
-        XCTAssertThrowsError(try runner.run(keyboardID: 42))
-        XCTAssertFalse(backend.operations.contains { operation in
-            if case .write = operation { return true }
-            return false
-        })
+        XCTAssertThrowsError(
+            try KeyboardBacklightRecoveryWatchdog(
+                backend: backend,
+                childRunner: child
+            ).run(keyboardID: 42)
+        )
+        XCTAssertEqual(backend.operations.suffix(2), [
+            .restore(42, 0.37),
+            .read(42)
+        ])
     }
 
-    func testRestoreFailureKeepsEmergencyRecoveryArmed() {
+    func testWatchdogPrioritizesRestoreFailureOverChildFailure() {
         let backend = RecordingKeyboardBacklightBackend(
             originalBrightness: 0.37,
             failure: .restore(42, 0.37),
-            readbacks: [0.37, 0.0, 0.5, 1.0]
+            readbacks: [0.37]
         )
-        let runner = KeyboardBacklightWriteTest(backend: backend)
+        let child = RecordingChildRunner(termination: .signaled(SIGKILL))
 
-        XCTAssertThrowsError(try runner.run(keyboardID: 42))
-        XCTAssertEqual(backend.operations.last, .restore(42, 0.37))
-        XCTAssertFalse(backend.operations.contains(.disarmRecovery))
+        XCTAssertThrowsError(
+            try KeyboardBacklightRecoveryWatchdog(
+                backend: backend,
+                childRunner: child
+            ).run(keyboardID: 42)
+        ) { error in
+            guard case KeyboardBacklightWatchdogError.restoreFailed = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
     }
 
     func testDefaultCommandIsReadOnlyInspection() throws {
@@ -99,18 +181,43 @@ final class KeyboardBacklightSafetyTests: XCTestCase {
         )
     }
 
-    func testReadbackMismatchRestoresOriginalAndFails() {
-        let backend = RecordingKeyboardBacklightBackend(
-            originalBrightness: 0.37,
-            readbacks: [0.37, 0.0, 0.4]
+    func testWriteCommandRejectsDuplicateOrUnknownFlags() {
+        XCTAssertThrowsError(
+            try KeyboardBacklightCommand(arguments: [
+                "--unsafe-write-test",
+                "--confirm-restore",
+                "--confirm-restore"
+            ])
         )
-        let runner = KeyboardBacklightWriteTest(backend: backend)
+        XCTAssertThrowsError(try KeyboardBacklightCommand(arguments: ["--internal-writer"]))
+    }
+}
 
-        XCTAssertThrowsError(try runner.run(keyboardID: 42))
-        XCTAssertEqual(backend.operations.suffix(2), [
-            .restore(42, 0.37),
-            .disarmRecovery
-        ])
+private enum TestError: Error {
+    case requested
+}
+
+private final class RecordingChildRunner: KeyboardBacklightChildRunning {
+    private let termination: KeyboardBacklightChildTermination?
+    private let error: Error?
+    private(set) var keyboardIDs: [UInt64] = []
+
+    init(termination: KeyboardBacklightChildTermination) {
+        self.termination = termination
+        error = nil
+    }
+
+    init(error: Error) {
+        termination = nil
+        self.error = error
+    }
+
+    func runWriter(keyboardID: UInt64) throws -> KeyboardBacklightChildTermination {
+        keyboardIDs.append(keyboardID)
+        if let error {
+            throw error
+        }
+        return try XCTUnwrap(termination)
     }
 }
 
@@ -119,10 +226,8 @@ private final class RecordingKeyboardBacklightBackend: KeyboardBacklightBackend 
         case list
         case isBuiltIn(UInt64)
         case read(UInt64)
-        case installRecovery(UInt64, Float)
         case write(UInt64, Float)
         case restore(UInt64, Float)
-        case disarmRecovery
     }
 
     enum Failure: Error {
@@ -159,20 +264,12 @@ private final class RecordingKeyboardBacklightBackend: KeyboardBacklightBackend 
         return readbacks.isEmpty ? originalBrightness : readbacks.removeFirst()
     }
 
-    func installRecovery(keyboardID: UInt64, originalBrightness: Float) throws {
-        try record(.installRecovery(keyboardID, originalBrightness))
-    }
-
     func setBrightness(_ brightness: Float, keyboardID: UInt64) throws {
         try record(.write(keyboardID, brightness))
     }
 
     func restoreBrightness(_ brightness: Float, keyboardID: UInt64) throws {
         try record(.restore(keyboardID, brightness))
-    }
-
-    func disarmRecovery() {
-        operations.append(.disarmRecovery)
     }
 
     private func record(_ operation: Operation) throws {
