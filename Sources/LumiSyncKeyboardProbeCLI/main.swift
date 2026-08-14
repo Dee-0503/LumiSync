@@ -35,7 +35,7 @@ do {
             )
         }
     case .writeTest:
-        fail("write test is unreachable until the watchdog gate passes")
+        fail("write test is unreachable until an independent recovery supervisor passes the safety gate")
     }
 } catch {
     fail(String(describing: error))

@@ -32,37 +32,57 @@ The CLI requires both explicit write confirmations, but still fails closed:
 swift run lumisync-keyboard-probe --unsafe-write-test --confirm-restore
 ```
 
-The command exits with `Real writes are blocked until out-of-process recovery is
-implemented.` The library now separates a child writer protocol from a parent
-recovery watchdog. Fake-backend tests cover the `0.0`, `0.5`, and `1.0` writer
-sequence, readback mismatch, normal child completion, thrown child-launch errors,
-`SIGINT`, `SIGTERM`, crash, kill, `SIGKILL`, restore failure, and restore-readback
-verification.
+The command exits with `Real writes are blocked until an independent recovery
+supervisor is proven.` The library separates a child writer protocol from a
+fake-backend recovery policy, but that policy is not a production supervisor.
+Fake-backend tests cover the `0.0`, `0.5`, and `1.0` writer sequence, readback
+mismatch, child outcomes, restore failure, and restore-readback verification
+without touching real hardware.
 
-## Watchdog blocker
+## Recovery architecture blocker
 
-A first POSIX child-process runner was intentionally removed after its integration
-tests left shell children behind and could hang beyond the five-second test budget.
-The fake protocol proves the parent recovery policy, but it does not prove that the
-real process runner always forwards termination, bounds `waitpid`, and reaps the
-writer without orphaning descendants. Therefore the safety gate is not met and the
-hardware setter remains unreachable from the CLI.
+The reviewed two-process prototype was removed. It ran the private setter/readback
+recovery synchronously in the parent watchdog, so a blocked private API call could
+hang forever and `SIGKILL` of that parent could prevent restoration entirely. A
+process-group runner cannot solve that failure mode by itself, and its successful
+fixture paths did not prove that cleanup uncertainty, escaped descendants, signal
+handler boundary races, or a hung restore were safe.
 
-Before enabling real writes, add a deterministic process harness with all of these
-properties:
+Real writes remain unreachable until a separate recovery supervisor owns the
+original brightness and survives termination of both the controller and writer.
+The required topology is at least:
 
-- every external-process test has a hard deadline below five seconds;
-- timeout cleanup kills the complete writer process group and reaps it;
-- normal exit, Swift throw, `SIGINT`, `SIGTERM`, crash, explicit kill, and `SIGKILL`
-  are exercised without orphan processes;
-- the parent independently owns keyboard ID and original brightness;
-- the parent restores and reads back the original brightness after every child
-  outcome;
-- any restore or verification uncertainty fails closed.
+1. an independent recovery supervisor that owns the original value and a hard
+   restore/readback deadline;
+2. a controller that requests one bounded write sequence;
+3. a writer that cannot daemonize, call `setsid`, change process group, or leave
+   descendants, enforced by protocol and integration tests.
 
-Only after that harness passes the filtered and full test suites may the reference
-machine set `0.0`, `0.5`, and `1.0`, verify every readback, and confirm the final
-value equals the captured original value.
+Before enabling the writer, deterministic failure-injection tests must prove all of
+the following under an outer test-process timeout:
+
+- a hung restore or readback is terminated by a hard deadline and reported as
+  unresolved restoration, never as success;
+- killing the controller or writer with `SIGKILL` leaves the independent supervisor
+  alive to attempt and verify restoration;
+- `SIGINT` and `SIGTERM` are blocked while handlers and pending state are changed,
+  consumed atomically, then either explicitly re-delivered or returned under a
+  documented caller contract;
+- signals arriving at handler-install and handler-restore boundaries are not lost;
+- primary operation and cleanup failures are returned together, with cleanup or
+  restoration uncertainty taking safety precedence;
+- handler restore failure, process-group signal failure, leader reap failure, an
+  ignored `SIGTERM`, and deadline expiry are injected and asserted;
+- the real writer topology rejects `fork`, daemonization, `setsid`, process-group
+  escape, and untracked descendants;
+- every process test has a hard deadline below five seconds and proves no owned
+  processes remain.
+
+Only after the independent writer executable and its authenticated, bounded CLI
+protocol are wired to that supervisor may the reference machine attempt `0.0`,
+`0.5`, and `1.0`, verify every readback, and verify the final restored value. Any
+private setter rejection, timeout, cleanup uncertainty, or restore uncertainty must
+leave the App capability unavailable and preserve the complete error context.
 
 ## API research
 

@@ -178,7 +178,12 @@ final class KeyboardBacklightSafetyTests: XCTestCase {
                 "--unsafe-write-test",
                 "--confirm-restore"
             ])
-        )
+        ) { error in
+            XCTAssertEqual(
+                String(describing: error),
+                "Real writes are blocked until an independent recovery supervisor is proven."
+            )
+        }
     }
 
     func testWriteCommandRejectsDuplicateOrUnknownFlags() {

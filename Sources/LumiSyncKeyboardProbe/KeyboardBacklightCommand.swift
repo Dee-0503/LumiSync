@@ -12,7 +12,7 @@ public enum KeyboardBacklightCommand: Equatable, Sendable {
             case .incompleteWriteConfirmation:
                 return "Writing requires both --unsafe-write-test and --confirm-restore."
             case .writeTestBlocked:
-                return "Real writes are blocked until out-of-process recovery is implemented."
+                return "Real writes are blocked until an independent recovery supervisor is proven."
             case let .unsupportedArguments(arguments):
                 return "Unsupported arguments: \(arguments.joined(separator: " "))."
             }
