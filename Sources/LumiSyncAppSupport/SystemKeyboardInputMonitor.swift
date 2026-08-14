@@ -9,8 +9,9 @@ import LumiSyncCore
 /// state and device identity. It is reported only after the listen-only CGEventTap confirms
 /// a corresponding keyDown. The key usage, keycode, character, and input sequence are never
 /// stored or forwarded; ambiguous or unmatched activity is dropped fail-closed.
-public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring {
+public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring, @unchecked Sendable {
     private let permissionStatus: @Sendable () -> InputMonitoringStatus
+    private let monotonicNanoseconds: @Sendable () -> UInt64
     private var eventTap: CFMachPort?
     private var eventTapSource: CFRunLoopSource?
     private var hidManager: IOHIDManager?
@@ -18,15 +19,20 @@ public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring {
     private var runtimeEventHandler: (@MainActor @Sendable (KeyboardInputMonitorRuntimeEvent) -> Void)?
     private var recordsByDevice: [IOHIDDevice: KeyboardDeviceRecord] = [:]
     private var inputGate = KeyboardInputEventGate()
+    private var deliveryGate = KeyboardInputDeliveryGate()
 
     public init(
         permissionStatus: @escaping @Sendable () -> InputMonitoringStatus = {
             IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted
                 ? .granted
                 : .denied
+        },
+        monotonicNanoseconds: @escaping @Sendable () -> UInt64 = {
+            DispatchTime.now().uptimeNanoseconds
         }
     ) {
         self.permissionStatus = permissionStatus
+        self.monotonicNanoseconds = monotonicNanoseconds
     }
 
     public func start(
@@ -36,11 +42,17 @@ public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring {
         guard permissionStatus() == .granted else {
             throw KeyboardInputMonitoringError.inputMonitoringNotAuthorized
         }
-        guard eventTap == nil else { return }
+        guard !deliveryGate.isRunning else { return }
 
+        _ = deliveryGate.start()
         self.handler = handler
         self.runtimeEventHandler = runtimeEventHandler
-        configureHIDManager()
+        do {
+            try configureHIDManager()
+        } catch {
+            stop()
+            throw error
+        }
 
         let mask = CGEventMask(1) << CGEventType.keyDown.rawValue
         guard let eventTap = CGEvent.tapCreate(
@@ -63,6 +75,7 @@ public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring {
     }
 
     public func stop() {
+        deliveryGate.stop()
         if let eventTap {
             CGEvent.tapEnable(tap: eventTap, enable: false)
         }
@@ -87,7 +100,7 @@ public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring {
         stop()
     }
 
-    private func configureHIDManager() {
+    private func configureHIDManager() throws {
         let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
         let keyboardMatching: [String: Any] = [
             kIOHIDDeviceUsagePageKey as String: kHIDPage_GenericDesktop,
@@ -110,7 +123,11 @@ public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring {
             Unmanaged.passUnretained(self).toOpaque()
         )
         IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
-        IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        let result = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        guard result == kIOReturnSuccess else {
+            IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
+            throw KeyboardInputMonitoringError.hidManagerUnavailable
+        }
         hidManager = manager
     }
 
@@ -125,7 +142,13 @@ public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring {
 
     private func receiveActivity(from value: IOHIDValue) {
         let element = IOHIDValueGetElement(value)
-        guard IOHIDElementGetType(element) == kIOHIDElementTypeInput_Button else { return }
+        guard KeyboardHIDElementFilter.isOrdinaryKeyPress(
+            usagePage: IOHIDElementGetUsagePage(element),
+            usage: IOHIDElementGetUsage(element),
+            integerValue: IOHIDValueGetIntegerValue(value)
+        ) else {
+            return
+        }
         let device = IOHIDElementGetDevice(element)
         guard let record = recordsByDevice[device] ?? KeyboardDeviceRecord(device: device) else {
             return
@@ -135,8 +158,20 @@ public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring {
             : .external(record.deviceID)
         inputGate.recordDeviceTransition(
             origin: origin,
-            isPressed: IOHIDValueGetIntegerValue(value) != 0
+            isPressed: true,
+            nowNanoseconds: monotonicNanoseconds()
         )
+    }
+
+    private func deliverOrigin(_ origin: KeyboardInputOrigin) {
+        let deliveryGeneration = deliveryGate.generation
+        Task { @MainActor [weak self] in
+            guard let self,
+                  self.deliveryGate.accepts(deliveryGeneration) else {
+                return
+            }
+            self.handler?(origin)
+        }
     }
 
     private func receiveTapEvent(_ type: CGEventType) {
@@ -147,10 +182,10 @@ public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring {
                 notifyRuntimeEvent(.permissionRevoked)
                 return
             }
-            guard let origin = inputGate.consumeKeyDown() else { return }
-            Task { @MainActor [handler] in
-                handler?(origin)
-            }
+            guard let origin = inputGate.consumeKeyDown(
+                nowNanoseconds: monotonicNanoseconds()
+            ) else { return }
+            deliverOrigin(origin)
         case .tapDisabledByTimeout:
             inputGate.invalidatePendingInput()
             notifyRuntimeEvent(.tapDisabledByTimeout)
@@ -167,8 +202,13 @@ public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring {
     }
 
     private func notifyRuntimeEvent(_ event: KeyboardInputMonitorRuntimeEvent) {
-        Task { @MainActor [runtimeEventHandler] in
-            runtimeEventHandler?(event)
+        let deliveryGeneration = deliveryGate.generation
+        Task { @MainActor [weak self] in
+            guard let self,
+                  self.deliveryGate.accepts(deliveryGeneration) else {
+                return
+            }
+            self.runtimeEventHandler?(event)
         }
     }
 

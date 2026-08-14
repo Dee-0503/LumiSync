@@ -1,28 +1,53 @@
 import LumiSyncCore
 
 struct KeyboardInputEventGate {
-    private var pendingOrigin: KeyboardInputOrigin?
+    private struct Candidate {
+        let origin: KeyboardInputOrigin
+        let timestampNanoseconds: UInt64
+    }
+
+    private let maximumAssociationNanoseconds: UInt64
+    private var candidate: Candidate?
     private var ambiguous = false
 
-    mutating func recordDeviceTransition(origin: KeyboardInputOrigin, isPressed: Bool) {
+    init(maximumAssociationNanoseconds: UInt64 = 5_000_000) {
+        self.maximumAssociationNanoseconds = maximumAssociationNanoseconds
+    }
+
+    mutating func recordDeviceTransition(
+        origin: KeyboardInputOrigin,
+        isPressed: Bool,
+        nowNanoseconds: UInt64
+    ) {
         guard isPressed else { return }
+        expireCandidate(nowNanoseconds: nowNanoseconds)
         guard !ambiguous else { return }
-        guard pendingOrigin == nil else {
-            pendingOrigin = nil
+        guard candidate == nil else {
+            candidate = nil
             ambiguous = true
             return
         }
-        pendingOrigin = origin
+        candidate = Candidate(origin: origin, timestampNanoseconds: nowNanoseconds)
     }
 
-    mutating func consumeKeyDown() -> KeyboardInputOrigin? {
+    mutating func consumeKeyDown(nowNanoseconds: UInt64) -> KeyboardInputOrigin? {
+        expireCandidate(nowNanoseconds: nowNanoseconds)
         defer { invalidatePendingInput() }
         guard !ambiguous else { return nil }
-        return pendingOrigin
+        return candidate?.origin
     }
 
     mutating func invalidatePendingInput() {
-        pendingOrigin = nil
+        candidate = nil
         ambiguous = false
+    }
+
+    private mutating func expireCandidate(nowNanoseconds: UInt64) {
+        guard let candidate else { return }
+        guard nowNanoseconds >= candidate.timestampNanoseconds,
+              nowNanoseconds - candidate.timestampNanoseconds <= maximumAssociationNanoseconds else {
+            invalidatePendingInput()
+            return
+        }
     }
 }

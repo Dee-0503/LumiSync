@@ -225,6 +225,44 @@ final class KeyboardInputCoordinationTests: XCTestCase {
         XCTAssertEqual(coordinator.snapshot.status, .stopped(.missingInputMonitoring))
     }
 
+    func testLateInputAfterStopDoesNotReactivateExternalPolicy() {
+        let keyboardInputMonitor = FakeKeyboardInputMonitor()
+        let coordinator = makeCoordinator(keyboardInputMonitor: keyboardInputMonitor)
+        coordinator.start()
+        let lateDelivery = keyboardInputMonitor.captureInputHandler()
+
+        coordinator.stop()
+        lateDelivery?(.external(KeyboardDeviceID(
+            transport: "USB",
+            vendorID: 1,
+            productID: 2,
+            locationID: 3
+        )))
+
+        XCTAssertFalse(coordinator.snapshot.externalKeyboardActive)
+        XCTAssertFalse(coordinator.snapshot.keyboardInputMonitoringActive)
+    }
+
+    func testLateInputAfterLockOrSleepDoesNotReactivateExternalPolicy() {
+        for event in [WorkspaceEvent.sessionLocked, .systemWillSleep] {
+            let keyboardInputMonitor = FakeKeyboardInputMonitor()
+            let coordinator = makeCoordinator(keyboardInputMonitor: keyboardInputMonitor)
+            coordinator.start()
+            let lateDelivery = keyboardInputMonitor.captureInputHandler()
+
+            coordinator.handleWorkspaceEvent(event)
+            lateDelivery?(.external(KeyboardDeviceID(
+                transport: "USB",
+                vendorID: 1,
+                productID: 2,
+                locationID: 3
+            )))
+
+            XCTAssertFalse(coordinator.snapshot.externalKeyboardActive)
+            XCTAssertFalse(coordinator.snapshot.keyboardInputMonitoringActive)
+        }
+    }
+
     func testUnavailableBacklightTracksExternalStateWithoutClaimingWrite() {
         let keyboardInputMonitor = FakeKeyboardInputMonitor()
         let coordinator = makeCoordinator(
@@ -305,6 +343,10 @@ private final class FakeKeyboardInputMonitor: KeyboardInputMonitoring {
     @MainActor
     func sendRuntimeEvent(_ event: KeyboardInputMonitorRuntimeEvent) {
         runtimeEventHandler?(event)
+    }
+
+    func captureInputHandler() -> (@MainActor @Sendable (KeyboardInputOrigin) -> Void)? {
+        handler
     }
 }
 

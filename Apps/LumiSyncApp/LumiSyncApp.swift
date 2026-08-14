@@ -67,6 +67,9 @@ final class AppModel: ObservableObject {
         self.lifecycleMonitor = lifecycleMonitor
         self.keyboardInputMonitor = keyboardInputMonitor
         snapshot = resolvedCoordinator.snapshot
+        resolvedCoordinator.onSnapshotChange = { [weak self] snapshot in
+            self?.snapshot = snapshot
+        }
 
         lifecycleMonitor.onEvent = { [weak self] event in
             self?.coordinator.handleWorkspaceEvent(event)

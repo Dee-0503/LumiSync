@@ -3,6 +3,7 @@ import LumiSyncCore
 
 public enum KeyboardInputMonitoringError: Error, Equatable {
     case inputMonitoringNotAuthorized
+    case hidManagerUnavailable
     case eventTapUnavailable
 }
 

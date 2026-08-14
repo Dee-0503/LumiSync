@@ -12,17 +12,17 @@ final class KeyboardInputEventGateTests: XCTestCase {
         )
         var gate = KeyboardInputEventGate()
 
-        gate.recordDeviceTransition(origin: .external(device), isPressed: true)
-        XCTAssertEqual(gate.consumeKeyDown(), .external(device))
-        XCTAssertNil(gate.consumeKeyDown())
+        gate.recordDeviceTransition(origin: .external(device), isPressed: true, nowNanoseconds: 0)
+        XCTAssertEqual(gate.consumeKeyDown(nowNanoseconds: 0), .external(device))
+        XCTAssertNil(gate.consumeKeyDown(nowNanoseconds: 0))
     }
 
     func testReleaseAndNonKeyboardChangesNeverProduceOrigin() {
         var gate = KeyboardInputEventGate()
 
-        gate.recordDeviceTransition(origin: .builtIn, isPressed: false)
+        gate.recordDeviceTransition(origin: .builtIn, isPressed: false, nowNanoseconds: 0)
 
-        XCTAssertNil(gate.consumeKeyDown())
+        XCTAssertNil(gate.consumeKeyDown(nowNanoseconds: 0))
     }
 
     func testMultipleUnmatchedDevicePressesFailClosed() {
@@ -40,18 +40,18 @@ final class KeyboardInputEventGateTests: XCTestCase {
         )
         var gate = KeyboardInputEventGate()
 
-        gate.recordDeviceTransition(origin: .external(first), isPressed: true)
-        gate.recordDeviceTransition(origin: .external(second), isPressed: true)
+        gate.recordDeviceTransition(origin: .external(first), isPressed: true, nowNanoseconds: 0)
+        gate.recordDeviceTransition(origin: .external(second), isPressed: true, nowNanoseconds: 1)
 
-        XCTAssertNil(gate.consumeKeyDown())
+        XCTAssertNil(gate.consumeKeyDown(nowNanoseconds: 1))
     }
 
     func testDisabledTapClearsPendingSource() {
         var gate = KeyboardInputEventGate()
-        gate.recordDeviceTransition(origin: .builtIn, isPressed: true)
+        gate.recordDeviceTransition(origin: .builtIn, isPressed: true, nowNanoseconds: 0)
 
         gate.invalidatePendingInput()
 
-        XCTAssertNil(gate.consumeKeyDown())
+        XCTAssertNil(gate.consumeKeyDown(nowNanoseconds: 0))
     }
 }

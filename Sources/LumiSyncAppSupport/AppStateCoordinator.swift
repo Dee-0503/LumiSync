@@ -51,7 +51,12 @@ public struct AppSnapshot: Equatable, Sendable {
 
 @MainActor
 public final class AppStateCoordinator: ObservableObject {
-    @Published public private(set) var snapshot: AppSnapshot
+    @Published public private(set) var snapshot: AppSnapshot {
+        didSet {
+            onSnapshotChange?(snapshot)
+        }
+    }
+    public var onSnapshotChange: (@MainActor @Sendable (AppSnapshot) -> Void)?
 
     private let preferencesStore: any AppPreferencesStoring
     private let displayBrightnessReader: any DisplayBrightnessReadingService
@@ -63,6 +68,7 @@ public final class AppStateCoordinator: ObservableObject {
     private let syncEngine = SyncEngine()
     private var preferences: AppPreferences
     private var externalKeyboardPolicy: ExternalKeyboardPolicy
+    private var keyboardInputGeneration: UInt64 = 0
 
     public init(
         preferencesStore: any AppPreferencesStoring,
@@ -221,12 +227,24 @@ public final class AppStateCoordinator: ObservableObject {
         }
 
         do {
+            keyboardInputGeneration &+= 1
+            let generation = keyboardInputGeneration
             try keyboardInputMonitor.start(
                 handler: { [weak self] origin in
-                    self?.recordKeyboardInput(origin)
+                    guard let self,
+                          self.snapshot.keyboardInputMonitoringActive,
+                          self.keyboardInputGeneration == generation else {
+                        return
+                    }
+                    self.recordKeyboardInput(origin)
                 },
                 runtimeEventHandler: { [weak self] event in
-                    self?.handleKeyboardInputRuntimeEvent(event)
+                    guard let self,
+                          self.snapshot.keyboardInputMonitoringActive,
+                          self.keyboardInputGeneration == generation else {
+                        return
+                    }
+                    self.handleKeyboardInputRuntimeEvent(event)
                 }
             )
             snapshot.keyboardInputMonitoringActive = true
@@ -239,6 +257,7 @@ public final class AppStateCoordinator: ObservableObject {
     }
 
     private func stopKeyboardInputMonitoring(resetPolicy: Bool) {
+        keyboardInputGeneration &+= 1
         if snapshot.keyboardInputMonitoringActive {
             keyboardInputMonitor?.stop()
         }
@@ -253,6 +272,7 @@ public final class AppStateCoordinator: ObservableObject {
     }
 
     private func handleKeyboardInputRuntimeEvent(_ event: KeyboardInputMonitorRuntimeEvent) {
+        keyboardInputGeneration &+= 1
         keyboardInputMonitor?.stop()
         reconciliationScheduler.cancel()
         snapshot.keyboardInputMonitoringActive = false
