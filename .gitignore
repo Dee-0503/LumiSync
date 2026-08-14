@@ -6,6 +6,7 @@
 *.xcodeproj/xcuserdata/
 .superpowers/
 release/
+build/
 *.dmg
 *.zip
 *.app
