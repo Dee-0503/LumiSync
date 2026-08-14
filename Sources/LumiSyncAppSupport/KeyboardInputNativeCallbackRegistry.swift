@@ -15,6 +15,25 @@ enum KeyboardInputNativeCallbackTrampoline {
     }
 }
 
+final class KeyboardInputNativeCallbackLeaseReleaseState: @unchecked Sendable {
+    private let lock = NSLock()
+    private let beforeStateTransition: (@Sendable () -> Void)?
+    private var released = false
+
+    init(beforeStateTransition: (@Sendable () -> Void)? = nil) {
+        self.beforeStateTransition = beforeStateTransition
+    }
+
+    func transitionToReleased() -> Bool {
+        lock.withLock {
+            guard !released else { return false }
+            beforeStateTransition?()
+            released = true
+            return true
+        }
+    }
+}
+
 /// Process-wide callback token registry. Native callbacks receive only the opaque token;
 /// they never dereference a Swift object through that raw pointer.
 final class KeyboardInputNativeCallbackRegistry: @unchecked Sendable {
@@ -24,31 +43,27 @@ final class KeyboardInputNativeCallbackRegistry: @unchecked Sendable {
         let context: KeyboardInputNativeCallbackContext
         private let registry: KeyboardInputNativeCallbackRegistry
         private let token: UInt
-        private let beforeReleaseStateCheck: (@Sendable () -> Void)?
-        private let releaseLock = NSLock()
-        private var released = false
+        private let releaseState: KeyboardInputNativeCallbackLeaseReleaseState
+        private let didReleaseLease: (@Sendable () -> Void)?
 
         fileprivate init(
             context: KeyboardInputNativeCallbackContext,
             registry: KeyboardInputNativeCallbackRegistry,
             token: UInt,
-            beforeReleaseStateCheck: (@Sendable () -> Void)?
+            releaseState: KeyboardInputNativeCallbackLeaseReleaseState,
+            didReleaseLease: (@Sendable () -> Void)?
         ) {
             self.context = context
             self.registry = registry
             self.token = token
-            self.beforeReleaseStateCheck = beforeReleaseStateCheck
+            self.releaseState = releaseState
+            self.didReleaseLease = didReleaseLease
         }
 
         func release() {
-            beforeReleaseStateCheck?()
-            let shouldRelease = releaseLock.withLock {
-                guard !released else { return false }
-                released = true
-                return true
-            }
-            guard shouldRelease else { return }
+            guard releaseState.transitionToReleased() else { return }
             registry.releaseLease(token: token)
+            didReleaseLease?()
         }
 
         deinit {
@@ -82,7 +97,8 @@ final class KeyboardInputNativeCallbackRegistry: @unchecked Sendable {
         _ rawToken: UnsafeMutableRawPointer?,
         afterIncrement: (@Sendable () -> Void)? = nil,
         whileLocked: (@Sendable () -> Void)? = nil,
-        beforeReleaseStateCheck: (@Sendable () -> Void)? = nil
+        beforeReleaseStateTransition: (@Sendable () -> Void)? = nil,
+        didReleaseLease: (@Sendable () -> Void)? = nil
     ) -> Lease? {
         guard let rawToken else { return nil }
         let token = UInt(bitPattern: rawToken)
@@ -102,7 +118,10 @@ final class KeyboardInputNativeCallbackRegistry: @unchecked Sendable {
             context: context,
             registry: self,
             token: token,
-            beforeReleaseStateCheck: beforeReleaseStateCheck
+            releaseState: KeyboardInputNativeCallbackLeaseReleaseState(
+                beforeStateTransition: beforeReleaseStateTransition
+            ),
+            didReleaseLease: didReleaseLease
         )
     }
 

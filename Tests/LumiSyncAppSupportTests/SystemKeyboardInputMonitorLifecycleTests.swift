@@ -149,29 +149,79 @@ final class SystemKeyboardInputMonitorLifecycleTests: XCTestCase {
         XCTAssertEqual(retired.wait(timeout: .now() + 1), .success)
     }
 
+    func testReleaseStateSerializesConcurrentTransition() {
+        let transitionEntered = DispatchSemaphore(value: 0)
+        let resumeTransition = DispatchSemaphore(value: 0)
+        let secondTransitionStarted = DispatchSemaphore(value: 0)
+        let state = KeyboardInputNativeCallbackLeaseReleaseState {
+            transitionEntered.signal()
+            resumeTransition.wait()
+        }
+        let results = LockedValues<Bool>()
+        let group = DispatchGroup()
+
+        group.enter()
+        DispatchQueue.global().async {
+            results.append(state.transitionToReleased())
+            group.leave()
+        }
+        XCTAssertEqual(transitionEntered.wait(timeout: .now() + 1), .success)
+
+        group.enter()
+        DispatchQueue.global().async {
+            secondTransitionStarted.signal()
+            results.append(state.transitionToReleased())
+            group.leave()
+        }
+        XCTAssertEqual(secondTransitionStarted.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(transitionEntered.wait(timeout: .now()), .timedOut)
+        resumeTransition.signal()
+        XCTAssertEqual(group.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(results.values.filter { $0 }.count, 1)
+        XCTAssertEqual(results.values.filter { !$0 }.count, 1)
+    }
+
     func testConcurrentLeaseReleaseOnlyDecrementsInFlightOnce() {
         let registry = KeyboardInputNativeCallbackRegistry.shared
         let token = registry.register(makeContext())
         let tokenBits = UInt(bitPattern: token)
-        let releaseBarrier = LeaseReleaseBarrier(participantCount: 2)
-        guard let lease = registry.acquire(token, beforeReleaseStateCheck: {
-            releaseBarrier.arriveAndWait()
-        }) else {
+        let transitionEntered = DispatchSemaphore(value: 0)
+        let resumeTransition = DispatchSemaphore(value: 0)
+        let secondReleaseStarted = DispatchSemaphore(value: 0)
+        let releaseCount = LockedCounter()
+        guard let lease = registry.acquire(
+            token,
+            beforeReleaseStateTransition: {
+                transitionEntered.signal()
+                resumeTransition.wait()
+            },
+            didReleaseLease: {
+                releaseCount.increment()
+            }
+        ) else {
             XCTFail("Expected registered token to acquire a lease")
             return
         }
         let releaseGroup = DispatchGroup()
 
-        for _ in 0..<2 {
-            releaseGroup.enter()
-            DispatchQueue.global().async {
-                lease.release()
-                releaseGroup.leave()
-            }
+        releaseGroup.enter()
+        DispatchQueue.global().async {
+            lease.release()
+            releaseGroup.leave()
         }
-        XCTAssertTrue(releaseBarrier.waitUntilAllArrived(timeout: 1))
-        releaseBarrier.resume()
+        XCTAssertEqual(transitionEntered.wait(timeout: .now() + 1), .success)
+
+        releaseGroup.enter()
+        DispatchQueue.global().async {
+            secondReleaseStarted.signal()
+            lease.release()
+            releaseGroup.leave()
+        }
+        XCTAssertEqual(secondReleaseStarted.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(transitionEntered.wait(timeout: .now()), .timedOut)
+        resumeTransition.signal()
         XCTAssertEqual(releaseGroup.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(releaseCount.value, 1)
 
         let retired = DispatchSemaphore(value: 0)
         DispatchQueue.global().async {
@@ -244,41 +294,33 @@ final class SystemKeyboardInputMonitorLifecycleTests: XCTestCase {
     }
 }
 
-private final class LeaseReleaseBarrier: @unchecked Sendable {
-    private let condition = NSCondition()
-    private let participantCount: Int
-    private var arrived = 0
-    private var isResumed = false
+private final class LockedValues<Element>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValues: [Element] = []
 
-    init(participantCount: Int) {
-        self.participantCount = participantCount
+    var values: [Element] {
+        lock.withLock { storedValues }
     }
 
-    func arriveAndWait() {
-        condition.lock()
-        arrived += 1
-        condition.broadcast()
-        while !isResumed {
-            condition.wait()
+    func append(_ value: Element) {
+        lock.withLock {
+            storedValues.append(value)
         }
-        condition.unlock()
+    }
+}
+
+private final class LockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue = 0
+
+    var value: Int {
+        lock.withLock { storedValue }
     }
 
-    func waitUntilAllArrived(timeout: TimeInterval) -> Bool {
-        let deadline = Date(timeIntervalSinceNow: timeout)
-        condition.lock()
-        defer { condition.unlock() }
-        while arrived < participantCount {
-            guard condition.wait(until: deadline) else { return false }
+    func increment() {
+        lock.withLock {
+            storedValue += 1
         }
-        return true
-    }
-
-    func resume() {
-        condition.lock()
-        isResumed = true
-        condition.broadcast()
-        condition.unlock()
     }
 }
 
