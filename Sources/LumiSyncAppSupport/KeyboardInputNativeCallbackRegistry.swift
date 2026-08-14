@@ -24,20 +24,24 @@ final class KeyboardInputNativeCallbackRegistry: @unchecked Sendable {
         let context: KeyboardInputNativeCallbackContext
         private let registry: KeyboardInputNativeCallbackRegistry
         private let token: UInt
+        private let beforeReleaseStateCheck: (@Sendable () -> Void)?
         private let releaseLock = NSLock()
         private var released = false
 
         fileprivate init(
             context: KeyboardInputNativeCallbackContext,
             registry: KeyboardInputNativeCallbackRegistry,
-            token: UInt
+            token: UInt,
+            beforeReleaseStateCheck: (@Sendable () -> Void)?
         ) {
             self.context = context
             self.registry = registry
             self.token = token
+            self.beforeReleaseStateCheck = beforeReleaseStateCheck
         }
 
         func release() {
+            beforeReleaseStateCheck?()
             let shouldRelease = releaseLock.withLock {
                 guard !released else { return false }
                 released = true
@@ -61,8 +65,6 @@ final class KeyboardInputNativeCallbackRegistry: @unchecked Sendable {
     private let condition = NSCondition()
     private var entries: [UInt: Entry] = [:]
     private var nextToken: UInt = 1
-    var didAcquireLease: (@Sendable () -> Void)?
-    var whileRegistryLocked: (@Sendable () -> Void)?
 
     private init() {}
 
@@ -78,7 +80,9 @@ final class KeyboardInputNativeCallbackRegistry: @unchecked Sendable {
 
     func acquire(
         _ rawToken: UnsafeMutableRawPointer?,
-        afterIncrement: (@Sendable () -> Void)? = nil
+        afterIncrement: (@Sendable () -> Void)? = nil,
+        whileLocked: (@Sendable () -> Void)? = nil,
+        beforeReleaseStateCheck: (@Sendable () -> Void)? = nil
     ) -> Lease? {
         guard let rawToken else { return nil }
         let token = UInt(bitPattern: rawToken)
@@ -90,15 +94,22 @@ final class KeyboardInputNativeCallbackRegistry: @unchecked Sendable {
         entry.inFlight += 1
         entries[token] = entry
         let context = entry.context
-        whileRegistryLocked?()
+        whileLocked?()
         condition.unlock()
 
         afterIncrement?()
-        didAcquireLease?()
-        return Lease(context: context, registry: self, token: token)
+        return Lease(
+            context: context,
+            registry: self,
+            token: token,
+            beforeReleaseStateCheck: beforeReleaseStateCheck
+        )
     }
 
-    func retire(_ rawToken: UnsafeMutableRawPointer) {
+    func retire(
+        _ rawToken: UnsafeMutableRawPointer,
+        beforeWait: (@Sendable () -> Void)? = nil
+    ) {
         let token = UInt(bitPattern: rawToken)
         condition.lock()
         guard var entry = entries[token] else {
@@ -107,6 +118,9 @@ final class KeyboardInputNativeCallbackRegistry: @unchecked Sendable {
         }
         entry.retired = true
         entries[token] = entry
+        if entry.inFlight > 0 {
+            beforeWait?()
+        }
         while entries[token]?.inFlight ?? 0 > 0 {
             condition.wait()
         }
