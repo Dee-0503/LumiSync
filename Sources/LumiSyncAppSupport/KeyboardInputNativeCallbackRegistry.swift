@@ -24,6 +24,7 @@ final class KeyboardInputNativeCallbackRegistry: @unchecked Sendable {
         let context: KeyboardInputNativeCallbackContext
         private let registry: KeyboardInputNativeCallbackRegistry
         private let token: UInt
+        private let releaseLock = NSLock()
         private var released = false
 
         fileprivate init(
@@ -37,8 +38,12 @@ final class KeyboardInputNativeCallbackRegistry: @unchecked Sendable {
         }
 
         func release() {
-            guard !released else { return }
-            released = true
+            let shouldRelease = releaseLock.withLock {
+                guard !released else { return false }
+                released = true
+                return true
+            }
+            guard shouldRelease else { return }
             registry.releaseLease(token: token)
         }
 
