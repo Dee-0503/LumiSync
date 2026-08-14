@@ -9,61 +9,94 @@ import LumiSyncCore
 /// state and device identity. It is reported only after the listen-only CGEventTap confirms
 /// a corresponding keyDown. The key usage, keycode, character, and input sequence are never
 /// stored or forwarded; ambiguous or unmatched activity is dropped fail-closed.
-public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring, @unchecked Sendable {
-    private let permissionStatus: @Sendable () -> InputMonitoringStatus
-    private let monotonicNanoseconds: @Sendable () -> UInt64
+@MainActor
+public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring {
+    private let nativeAPI: SystemKeyboardInputNativeAPI
     private var eventTap: CFMachPort?
     private var eventTapSource: CFRunLoopSource?
     private var hidManager: IOHIDManager?
-    private var handler: (@MainActor @Sendable (KeyboardInputOrigin) -> Void)?
-    private var runtimeEventHandler: (@MainActor @Sendable (KeyboardInputMonitorRuntimeEvent) -> Void)?
-    private var recordsByDevice: [IOHIDDevice: KeyboardDeviceRecord] = [:]
-    private var inputGate = KeyboardInputEventGate()
-    private var deliveryGate = KeyboardInputDeliveryGate()
+    private var callbackContext: KeyboardInputNativeCallbackContext?
+    private var callbackContextReference: Unmanaged<KeyboardInputNativeCallbackContext>?
 
-    public init(
-        permissionStatus: @escaping @Sendable () -> InputMonitoringStatus = {
-            IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted
-                ? .granted
-                : .denied
-        },
-        monotonicNanoseconds: @escaping @Sendable () -> UInt64 = {
-            DispatchTime.now().uptimeNanoseconds
-        }
-    ) {
-        self.permissionStatus = permissionStatus
-        self.monotonicNanoseconds = monotonicNanoseconds
+    public convenience init() {
+        self.init(nativeAPI: .live)
+    }
+
+    init(nativeAPI: SystemKeyboardInputNativeAPI) {
+        self.nativeAPI = nativeAPI
     }
 
     public func start(
         handler: @escaping @MainActor @Sendable (KeyboardInputOrigin) -> Void,
         runtimeEventHandler: @escaping @MainActor @Sendable (KeyboardInputMonitorRuntimeEvent) -> Void
     ) throws {
-        guard permissionStatus() == .granted else {
+        guard nativeAPI.permissionStatus() == .granted else {
             throw KeyboardInputMonitoringError.inputMonitoringNotAuthorized
         }
-        guard !deliveryGate.isRunning else { return }
+        guard callbackContext == nil else { return }
 
-        _ = deliveryGate.start()
-        self.handler = handler
-        self.runtimeEventHandler = runtimeEventHandler
+        let context = KeyboardInputNativeCallbackContext(
+            permissionStatus: nativeAPI.permissionStatus,
+            monotonicNanoseconds: nativeAPI.monotonicNanoseconds,
+            handler: handler,
+            runtimeEventHandler: runtimeEventHandler
+        )
+        let contextReference = Unmanaged.passRetained(context)
+        callbackContext = context
+        callbackContextReference = contextReference
+
         do {
-            try configureHIDManager()
+            try configureHIDManager(context: contextReference.toOpaque())
+            try configureEventTap(context: contextReference.toOpaque())
         } catch {
-            stop()
+            teardownNativeResources()
             throw error
         }
+    }
 
+    public func stop() {
+        teardownNativeResources()
+    }
+
+    deinit {
+        MainActor.assumeIsolated {
+            teardownNativeResources()
+        }
+    }
+
+    private func configureHIDManager(context: UnsafeMutableRawPointer) throws {
+        let manager = nativeAPI.createHIDManager()
+        let keyboardMatching: [String: Any] = [
+            kIOHIDDeviceUsagePageKey as String: kHIDPage_GenericDesktop,
+            kIOHIDDeviceUsageKey as String: kHIDUsage_GD_Keyboard
+        ]
+        IOHIDManagerSetDeviceMatching(manager, keyboardMatching as CFDictionary)
+        IOHIDManagerRegisterDeviceMatchingCallback(
+            manager,
+            Self.deviceMatchedCallback,
+            context
+        )
+        IOHIDManagerRegisterDeviceRemovalCallback(
+            manager,
+            Self.deviceRemovedCallback,
+            context
+        )
+        IOHIDManagerRegisterInputValueCallback(
+            manager,
+            Self.inputValueCallback,
+            context
+        )
+        nativeAPI.scheduleHIDManager(manager)
+        hidManager = manager
+
+        guard nativeAPI.openHIDManager(manager) == kIOReturnSuccess else {
+            throw KeyboardInputMonitoringError.hidManagerUnavailable
+        }
+    }
+
+    private func configureEventTap(context: UnsafeMutableRawPointer) throws {
         let mask = CGEventMask(1) << CGEventType.keyDown.rawValue
-        guard let eventTap = CGEvent.tapCreate(
-            tap: .cgSessionEventTap,
-            place: .tailAppendEventTap,
-            options: .listenOnly,
-            eventsOfInterest: mask,
-            callback: Self.eventTapCallback,
-            userInfo: Unmanaged.passUnretained(self).toOpaque()
-        ) else {
-            stop()
+        guard let eventTap = nativeAPI.createEventTap(mask, Self.eventTapCallback, context) else {
             throw KeyboardInputMonitoringError.eventTapUnavailable
         }
 
@@ -74,10 +107,22 @@ public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring, @uncheck
         CGEvent.tapEnable(tap: eventTap, enable: true)
     }
 
-    public func stop() {
-        deliveryGate.stop()
+    private func teardownNativeResources() {
+        guard callbackContext != nil
+                || callbackContextReference != nil
+                || hidManager != nil
+                || eventTap != nil else {
+            return
+        }
+
+        callbackContext?.deactivate()
+
+        if let hidManager {
+            nativeAPI.unregisterHIDCallbacks(hidManager)
+        }
         if let eventTap {
             CGEvent.tapEnable(tap: eventTap, enable: false)
+            CFMachPortInvalidate(eventTap)
         }
         if let eventTapSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), eventTapSource, .commonModes)
@@ -86,61 +131,171 @@ public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring, @uncheck
         eventTap = nil
 
         if let hidManager {
-            IOHIDManagerUnscheduleFromRunLoop(hidManager, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
-            IOHIDManagerClose(hidManager, IOOptionBits(kIOHIDOptionsTypeNone))
+            nativeAPI.unscheduleHIDManager(hidManager)
+            nativeAPI.closeHIDManager(hidManager)
         }
         hidManager = nil
-        recordsByDevice.removeAll()
-        inputGate.invalidatePendingInput()
-        handler = nil
-        runtimeEventHandler = nil
+
+        callbackContext?.synchronizeWithCallbacks()
+        callbackContext = nil
+        callbackContextReference?.release()
+        callbackContextReference = nil
     }
 
-    deinit {
-        stop()
+    private static let eventTapCallback: CGEventTapCallBack = { _, type, event, userInfo in
+        guard let userInfo else { return Unmanaged.passUnretained(event) }
+        Unmanaged<KeyboardInputNativeCallbackContext>
+            .fromOpaque(userInfo)
+            .takeUnretainedValue()
+            .receiveTapEvent(type)
+        return Unmanaged.passUnretained(event)
     }
 
-    private func configureHIDManager() throws {
-        let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
-        let keyboardMatching: [String: Any] = [
-            kIOHIDDeviceUsagePageKey as String: kHIDPage_GenericDesktop,
-            kIOHIDDeviceUsageKey as String: kHIDUsage_GD_Keyboard
-        ]
-        IOHIDManagerSetDeviceMatching(manager, keyboardMatching as CFDictionary)
-        IOHIDManagerRegisterDeviceMatchingCallback(
-            manager,
-            Self.deviceMatchedCallback,
-            Unmanaged.passUnretained(self).toOpaque()
-        )
-        IOHIDManagerRegisterDeviceRemovalCallback(
-            manager,
-            Self.deviceRemovedCallback,
-            Unmanaged.passUnretained(self).toOpaque()
-        )
-        IOHIDManagerRegisterInputValueCallback(
-            manager,
-            Self.inputValueCallback,
-            Unmanaged.passUnretained(self).toOpaque()
-        )
-        IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
-        let result = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
-        guard result == kIOReturnSuccess else {
-            IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
-            throw KeyboardInputMonitoringError.hidManagerUnavailable
+    private static let deviceMatchedCallback: IOHIDDeviceCallback = { context, _, _, device in
+        guard let context else { return }
+        Unmanaged<KeyboardInputNativeCallbackContext>
+            .fromOpaque(context)
+            .takeUnretainedValue()
+            .deviceMatched(device)
+    }
+
+    private static let deviceRemovedCallback: IOHIDDeviceCallback = { context, _, _, device in
+        guard let context else { return }
+        Unmanaged<KeyboardInputNativeCallbackContext>
+            .fromOpaque(context)
+            .takeUnretainedValue()
+            .deviceRemoved(device)
+    }
+
+    private static let inputValueCallback: IOHIDValueCallback = { context, _, _, value in
+        guard let context else { return }
+        Unmanaged<KeyboardInputNativeCallbackContext>
+            .fromOpaque(context)
+            .takeUnretainedValue()
+            .receiveActivity(from: value)
+    }
+}
+
+struct SystemKeyboardInputNativeAPI: Sendable {
+    let permissionStatus: @Sendable () -> InputMonitoringStatus
+    let monotonicNanoseconds: @Sendable () -> UInt64
+    let createHIDManager: @Sendable () -> IOHIDManager
+    let scheduleHIDManager: @Sendable (IOHIDManager) -> Void
+    let openHIDManager: @Sendable (IOHIDManager) -> IOReturn
+    let unregisterHIDCallbacks: @Sendable (IOHIDManager) -> Void
+    let unscheduleHIDManager: @Sendable (IOHIDManager) -> Void
+    let closeHIDManager: @Sendable (IOHIDManager) -> Void
+    let createEventTap: @Sendable (
+        CGEventMask,
+        @escaping CGEventTapCallBack,
+        UnsafeMutableRawPointer
+    ) -> CFMachPort?
+
+    static let live = SystemKeyboardInputNativeAPI(
+        permissionStatus: {
+            IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted
+                ? .granted
+                : .denied
+        },
+        monotonicNanoseconds: {
+            DispatchTime.now().uptimeNanoseconds
+        },
+        createHIDManager: {
+            IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+        },
+        scheduleHIDManager: { manager in
+            IOHIDManagerScheduleWithRunLoop(
+                manager,
+                CFRunLoopGetMain(),
+                CFRunLoopMode.commonModes.rawValue
+            )
+        },
+        openHIDManager: { manager in
+            IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        },
+        unregisterHIDCallbacks: { manager in
+            IOHIDManagerRegisterDeviceMatchingCallback(manager, nil, nil)
+            IOHIDManagerRegisterDeviceRemovalCallback(manager, nil, nil)
+            IOHIDManagerRegisterInputValueCallback(manager, nil, nil)
+        },
+        unscheduleHIDManager: { manager in
+            IOHIDManagerUnscheduleFromRunLoop(
+                manager,
+                CFRunLoopGetMain(),
+                CFRunLoopMode.commonModes.rawValue
+            )
+        },
+        closeHIDManager: { manager in
+            IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        },
+        createEventTap: { mask, callback, context in
+            CGEvent.tapCreate(
+                tap: .cgSessionEventTap,
+                place: .tailAppendEventTap,
+                options: .listenOnly,
+                eventsOfInterest: mask,
+                callback: callback,
+                userInfo: context
+            )
         }
-        hidManager = manager
+    )
+}
+
+final class KeyboardInputNativeCallbackContext: @unchecked Sendable {
+    private let lock = NSLock()
+    private let permissionStatus: @Sendable () -> InputMonitoringStatus
+    private let monotonicNanoseconds: @Sendable () -> UInt64
+    private var handler: (@MainActor @Sendable (KeyboardInputOrigin) -> Void)?
+    private var runtimeEventHandler: (@MainActor @Sendable (KeyboardInputMonitorRuntimeEvent) -> Void)?
+    private var recordsByDevice: [IOHIDDevice: KeyboardDeviceRecord] = [:]
+    private var inputGate = KeyboardInputEventGate()
+    private var deliveryGate = KeyboardInputDeliveryGate()
+
+    init(
+        permissionStatus: @escaping @Sendable () -> InputMonitoringStatus,
+        monotonicNanoseconds: @escaping @Sendable () -> UInt64,
+        handler: @escaping @MainActor @Sendable (KeyboardInputOrigin) -> Void,
+        runtimeEventHandler: @escaping @MainActor @Sendable (KeyboardInputMonitorRuntimeEvent) -> Void
+    ) {
+        self.permissionStatus = permissionStatus
+        self.monotonicNanoseconds = monotonicNanoseconds
+        self.handler = handler
+        self.runtimeEventHandler = runtimeEventHandler
+        _ = deliveryGate.start()
     }
 
-    private func deviceMatched(_ device: IOHIDDevice) {
-        guard let record = KeyboardDeviceRecord(device: device) else { return }
-        recordsByDevice[device] = record
+    func deactivate() {
+        lock.withLock {
+            deliveryGate.stop()
+            recordsByDevice.removeAll()
+            inputGate.invalidatePendingInput()
+            handler = nil
+            runtimeEventHandler = nil
+        }
     }
 
-    private func deviceRemoved(_ device: IOHIDDevice) {
-        recordsByDevice.removeValue(forKey: device)
+    func synchronizeWithCallbacks() {
+        lock.withLock {}
     }
 
-    private func receiveActivity(from value: IOHIDValue) {
+    func deviceMatched(_ device: IOHIDDevice) {
+        lock.withLock {
+            guard deliveryGate.isRunning,
+                  let record = KeyboardDeviceRecord(device: device) else {
+                return
+            }
+            recordsByDevice[device] = record
+        }
+    }
+
+    func deviceRemoved(_ device: IOHIDDevice) {
+        lock.withLock {
+            guard deliveryGate.isRunning else { return }
+            recordsByDevice.removeValue(forKey: device)
+        }
+    }
+
+    func receiveActivity(from value: IOHIDValue) {
         let element = IOHIDValueGetElement(value)
         guard KeyboardHIDElementFilter.isOrdinaryKeyPress(
             usagePage: IOHIDElementGetUsagePage(element),
@@ -150,47 +305,58 @@ public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring, @uncheck
             return
         }
         let device = IOHIDElementGetDevice(element)
-        guard let record = recordsByDevice[device] ?? KeyboardDeviceRecord(device: device) else {
+        let record: KeyboardDeviceRecord? = lock.withLock {
+            guard deliveryGate.isRunning else { return nil }
+            return recordsByDevice[device] ?? KeyboardDeviceRecord(device: device)
+        }
+        guard let record else {
             return
         }
-        let origin: KeyboardInputOrigin = record.isBuiltIn
-            ? .builtIn
-            : .external(record.deviceID)
-        inputGate.recordDeviceTransition(
-            origin: origin,
-            isPressed: true,
+        recordActivity(
+            origin: record.isBuiltIn ? .builtIn : .external(record.deviceID),
             nowNanoseconds: monotonicNanoseconds()
         )
     }
 
-    private func deliverOrigin(_ origin: KeyboardInputOrigin) {
-        let deliveryGeneration = deliveryGate.generation
-        Task { @MainActor [weak self] in
-            guard let self,
-                  self.deliveryGate.accepts(deliveryGeneration) else {
-                return
-            }
-            self.handler?(origin)
+    func recordActivity(origin: KeyboardInputOrigin, nowNanoseconds: UInt64) {
+        lock.withLock {
+            guard deliveryGate.isRunning else { return }
+            inputGate.recordDeviceTransition(
+                origin: origin,
+                isPressed: true,
+                nowNanoseconds: nowNanoseconds
+            )
         }
     }
 
-    private func receiveTapEvent(_ type: CGEventType) {
+    func receiveTapEvent(_ type: CGEventType) {
         switch type {
         case .keyDown:
             guard permissionStatus() == .granted else {
-                inputGate.invalidatePendingInput()
+                lock.withLock {
+                    inputGate.invalidatePendingInput()
+                }
                 notifyRuntimeEvent(.permissionRevoked)
                 return
             }
-            guard let origin = inputGate.consumeKeyDown(
-                nowNanoseconds: monotonicNanoseconds()
-            ) else { return }
-            deliverOrigin(origin)
+            let origin: KeyboardInputOrigin? = lock.withLock {
+                guard deliveryGate.isRunning else { return nil }
+                return inputGate.consumeKeyDown(
+                    nowNanoseconds: monotonicNanoseconds()
+                )
+            }
+            if let origin {
+                deliverOrigin(origin)
+            }
         case .tapDisabledByTimeout:
-            inputGate.invalidatePendingInput()
+            lock.withLock {
+                inputGate.invalidatePendingInput()
+            }
             notifyRuntimeEvent(.tapDisabledByTimeout)
         case .tapDisabledByUserInput:
-            inputGate.invalidatePendingInput()
+            lock.withLock {
+                inputGate.invalidatePendingInput()
+            }
             notifyRuntimeEvent(
                 permissionStatus() == .granted
                     ? .tapDisabledByUserInput
@@ -201,48 +367,38 @@ public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring, @uncheck
         }
     }
 
-    private func notifyRuntimeEvent(_ event: KeyboardInputMonitorRuntimeEvent) {
-        let deliveryGeneration = deliveryGate.generation
+    private func deliverOrigin(_ origin: KeyboardInputOrigin) {
+        let delivery = lock.withLock {
+            (deliveryGate.generation, handler)
+        }
+        guard let handler = delivery.1 else { return }
         Task { @MainActor [weak self] in
             guard let self,
-                  self.deliveryGate.accepts(deliveryGeneration) else {
+                  self.accepts(delivery.0) else {
                 return
             }
-            self.runtimeEventHandler?(event)
+            handler(origin)
         }
     }
 
-    private static let eventTapCallback: CGEventTapCallBack = { _, type, event, userInfo in
-        guard let userInfo else { return Unmanaged.passUnretained(event) }
-        Unmanaged<SystemKeyboardInputMonitor>
-            .fromOpaque(userInfo)
-            .takeUnretainedValue()
-            .receiveTapEvent(type)
-        return Unmanaged.passUnretained(event)
+    private func notifyRuntimeEvent(_ event: KeyboardInputMonitorRuntimeEvent) {
+        let delivery = lock.withLock {
+            (deliveryGate.generation, runtimeEventHandler)
+        }
+        guard let runtimeEventHandler = delivery.1 else { return }
+        Task { @MainActor [weak self] in
+            guard let self,
+                  self.accepts(delivery.0) else {
+                return
+            }
+            runtimeEventHandler(event)
+        }
     }
 
-    private static let deviceMatchedCallback: IOHIDDeviceCallback = { context, _, _, device in
-        guard let context else { return }
-        Unmanaged<SystemKeyboardInputMonitor>
-            .fromOpaque(context)
-            .takeUnretainedValue()
-            .deviceMatched(device)
-    }
-
-    private static let deviceRemovedCallback: IOHIDDeviceCallback = { context, _, _, device in
-        guard let context else { return }
-        Unmanaged<SystemKeyboardInputMonitor>
-            .fromOpaque(context)
-            .takeUnretainedValue()
-            .deviceRemoved(device)
-    }
-
-    private static let inputValueCallback: IOHIDValueCallback = { context, _, _, value in
-        guard let context else { return }
-        Unmanaged<SystemKeyboardInputMonitor>
-            .fromOpaque(context)
-            .takeUnretainedValue()
-            .receiveActivity(from: value)
+    private func accepts(_ generation: UInt64) -> Bool {
+        lock.withLock {
+            deliveryGate.accepts(generation)
+        }
     }
 }
 

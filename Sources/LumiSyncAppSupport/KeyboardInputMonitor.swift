@@ -15,6 +15,7 @@ public enum KeyboardInputMonitorRuntimeEvent: Equatable, Sendable {
 
 /// Reports only the originating keyboard class and non-sensitive device identity.
 /// Implementations must not expose or retain keycodes, characters, or input sequences.
+@MainActor
 public protocol KeyboardInputMonitoring: AnyObject {
     func start(
         handler: @escaping @MainActor @Sendable (KeyboardInputOrigin) -> Void,

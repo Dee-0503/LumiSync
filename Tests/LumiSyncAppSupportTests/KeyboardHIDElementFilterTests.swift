@@ -98,4 +98,41 @@ final class KeyboardInputEventGateWindowTests: XCTestCase {
         XCTAssertEqual(gate.consumeKeyDown(nowNanoseconds: 15_000_000), .builtIn)
         XCTAssertNil(gate.consumeKeyDown(nowNanoseconds: 15_000_000))
     }
+
+    func testExpiredAmbiguityAllowsNextAssociationWindow() {
+        let firstDevice = KeyboardDeviceID(
+            transport: "USB",
+            vendorID: 1,
+            productID: 2,
+            locationID: 3
+        )
+        let nextDevice = KeyboardDeviceID(
+            transport: "Bluetooth",
+            vendorID: 4,
+            productID: 5,
+            locationID: 6
+        )
+        var gate = KeyboardInputEventGate(maximumAssociationNanoseconds: 5_000_000)
+        gate.recordDeviceTransition(
+            origin: .builtIn,
+            isPressed: true,
+            nowNanoseconds: 10_000_000
+        )
+        gate.recordDeviceTransition(
+            origin: .external(firstDevice),
+            isPressed: true,
+            nowNanoseconds: 10_000_001
+        )
+
+        gate.recordDeviceTransition(
+            origin: .external(nextDevice),
+            isPressed: true,
+            nowNanoseconds: 15_000_002
+        )
+
+        XCTAssertEqual(
+            gate.consumeKeyDown(nowNanoseconds: 15_000_003),
+            .external(nextDevice)
+        )
+    }
 }

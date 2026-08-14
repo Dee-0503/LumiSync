@@ -8,7 +8,7 @@ struct KeyboardInputEventGate {
 
     private let maximumAssociationNanoseconds: UInt64
     private var candidate: Candidate?
-    private var ambiguous = false
+    private var ambiguityTimestampNanoseconds: UInt64?
 
     init(maximumAssociationNanoseconds: UInt64 = 5_000_000) {
         self.maximumAssociationNanoseconds = maximumAssociationNanoseconds
@@ -20,34 +20,50 @@ struct KeyboardInputEventGate {
         nowNanoseconds: UInt64
     ) {
         guard isPressed else { return }
-        expireCandidate(nowNanoseconds: nowNanoseconds)
-        guard !ambiguous else { return }
+        expirePendingInput(nowNanoseconds: nowNanoseconds)
+        guard ambiguityTimestampNanoseconds == nil else { return }
         guard candidate == nil else {
             candidate = nil
-            ambiguous = true
+            ambiguityTimestampNanoseconds = nowNanoseconds
             return
         }
         candidate = Candidate(origin: origin, timestampNanoseconds: nowNanoseconds)
     }
 
     mutating func consumeKeyDown(nowNanoseconds: UInt64) -> KeyboardInputOrigin? {
-        expireCandidate(nowNanoseconds: nowNanoseconds)
+        expirePendingInput(nowNanoseconds: nowNanoseconds)
         defer { invalidatePendingInput() }
-        guard !ambiguous else { return nil }
+        guard ambiguityTimestampNanoseconds == nil else { return nil }
         return candidate?.origin
     }
 
     mutating func invalidatePendingInput() {
         candidate = nil
-        ambiguous = false
+        ambiguityTimestampNanoseconds = nil
     }
 
-    private mutating func expireCandidate(nowNanoseconds: UInt64) {
-        guard let candidate else { return }
-        guard nowNanoseconds >= candidate.timestampNanoseconds,
-              nowNanoseconds - candidate.timestampNanoseconds <= maximumAssociationNanoseconds else {
-            invalidatePendingInput()
-            return
+    private mutating func expirePendingInput(nowNanoseconds: UInt64) {
+        if let candidate,
+           isOutsideAssociationWindow(
+               since: candidate.timestampNanoseconds,
+               nowNanoseconds: nowNanoseconds
+           ) {
+            self.candidate = nil
         }
+        if let ambiguityTimestampNanoseconds,
+           isOutsideAssociationWindow(
+               since: ambiguityTimestampNanoseconds,
+               nowNanoseconds: nowNanoseconds
+           ) {
+            self.ambiguityTimestampNanoseconds = nil
+        }
+    }
+
+    private func isOutsideAssociationWindow(
+        since timestampNanoseconds: UInt64,
+        nowNanoseconds: UInt64
+    ) -> Bool {
+        nowNanoseconds < timestampNanoseconds
+            || nowNanoseconds - timestampNanoseconds > maximumAssociationNanoseconds
     }
 }
