@@ -3,6 +3,7 @@ import LumiSyncCore
 
 public enum AppStopReason: Equatable, Sendable {
     case missingInputMonitoring
+    case keyboardInputMonitoringUnavailable
     case keyboardBacklightUnavailable
     case displayBrightnessUnavailable
     case keyboardBacklightWriteFailed
@@ -96,13 +97,18 @@ public final class AppStateCoordinator: ObservableObject {
     }
 
     public func stop() {
-        keyboardInputMonitor?.stop()
-        reconciliationScheduler.cancel()
-        snapshot.keyboardInputMonitoringActive = false
+        stopKeyboardInputMonitoring(resetPolicy: true)
     }
 
     public func refresh() {
         updateCapabilityStatus()
+        guard shouldMonitorKeyboardInput else {
+            stopKeyboardInputMonitoring(resetPolicy: true)
+            if snapshot.inputMonitoringStatus != .granted {
+                snapshot.status = .stopped(.missingInputMonitoring)
+            }
+            return
+        }
 
         if preferences.isPaused {
             snapshot.status = .paused
@@ -110,7 +116,7 @@ public final class AppStateCoordinator: ObservableObject {
         }
 
         guard snapshot.inputMonitoringStatus == .granted else {
-            stopKeyboardInputMonitoring()
+            stopKeyboardInputMonitoring(resetPolicy: true)
             snapshot.status = .stopped(.missingInputMonitoring)
             return
         }
@@ -156,18 +162,21 @@ public final class AppStateCoordinator: ObservableObject {
         switch event {
         case .sessionLocked:
             snapshot.sessionLocked = true
+            stopKeyboardInputMonitoring(resetPolicy: true)
             reconcile()
         case .sessionUnlocked:
             snapshot.sessionLocked = false
             refresh()
         case .displayWillSleep:
             snapshot.displayAsleep = true
+            stopKeyboardInputMonitoring(resetPolicy: true)
             reconcile()
         case .displayDidWake:
             snapshot.displayAsleep = false
             refresh()
         case .systemWillSleep:
             snapshot.systemAsleep = true
+            stopKeyboardInputMonitoring(resetPolicy: true)
             reconcile()
         case .systemDidWake:
             snapshot.systemAsleep = false
@@ -197,29 +206,70 @@ public final class AppStateCoordinator: ObservableObject {
         snapshot.externalKeyboardActive = externalKeyboardPolicy.isExternalKeyboardActive
     }
 
+    private var shouldMonitorKeyboardInput: Bool {
+        snapshot.inputMonitoringStatus == .granted
+            && !snapshot.sessionLocked
+            && !snapshot.displayAsleep
+            && !snapshot.systemAsleep
+    }
+
     private func updateKeyboardInputMonitoring() {
-        guard snapshot.inputMonitoringStatus == .granted,
+        guard shouldMonitorKeyboardInput,
               let keyboardInputMonitor,
               !snapshot.keyboardInputMonitoringActive else {
             return
         }
 
         do {
-            try keyboardInputMonitor.start { [weak self] origin in
-                self?.recordKeyboardInput(origin)
-            }
+            try keyboardInputMonitor.start(
+                handler: { [weak self] origin in
+                    self?.recordKeyboardInput(origin)
+                },
+                runtimeEventHandler: { [weak self] event in
+                    self?.handleKeyboardInputRuntimeEvent(event)
+                }
+            )
             snapshot.keyboardInputMonitoringActive = true
         } catch {
             snapshot.keyboardInputMonitoringActive = false
-            snapshot.status = .stopped(.missingInputMonitoring)
+            snapshot.status = snapshot.inputMonitoringStatus == .granted
+                ? .stopped(.keyboardInputMonitoringUnavailable)
+                : .stopped(.missingInputMonitoring)
         }
     }
 
-    private func stopKeyboardInputMonitoring() {
-        guard snapshot.keyboardInputMonitoringActive else { return }
+    private func stopKeyboardInputMonitoring(resetPolicy: Bool) {
+        if snapshot.keyboardInputMonitoringActive {
+            keyboardInputMonitor?.stop()
+        }
+        reconciliationScheduler.cancel()
+        snapshot.keyboardInputMonitoringActive = false
+        if resetPolicy {
+            externalKeyboardPolicy = ExternalKeyboardPolicy(
+                excludedDevices: preferences.core.excludedKeyboardDevices
+            )
+            snapshot.externalKeyboardActive = false
+        }
+    }
+
+    private func handleKeyboardInputRuntimeEvent(_ event: KeyboardInputMonitorRuntimeEvent) {
         keyboardInputMonitor?.stop()
         reconciliationScheduler.cancel()
         snapshot.keyboardInputMonitoringActive = false
+        externalKeyboardPolicy = ExternalKeyboardPolicy(
+            excludedDevices: preferences.core.excludedKeyboardDevices
+        )
+        snapshot.externalKeyboardActive = false
+        updateCapabilityStatus()
+
+        switch event {
+        case .permissionRevoked:
+            snapshot.status = .stopped(.missingInputMonitoring)
+        case .tapDisabledByTimeout, .tapDisabledByUserInput:
+            snapshot.status = snapshot.inputMonitoringStatus == .granted
+                ? .stopped(.keyboardInputMonitoringUnavailable)
+                : .stopped(.missingInputMonitoring)
+        }
     }
 
     private func recordKeyboardInput(_ origin: KeyboardInputOrigin) {
@@ -263,7 +313,7 @@ public final class AppStateCoordinator: ObservableObject {
         }
 
         guard snapshot.inputMonitoringStatus == .granted else {
-            stopKeyboardInputMonitoring()
+            stopKeyboardInputMonitoring(resetPolicy: true)
             snapshot.status = .stopped(.missingInputMonitoring)
             return
         }

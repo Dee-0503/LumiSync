@@ -98,6 +98,8 @@ final class AppModel: ObservableObject {
             switch reason {
             case .missingInputMonitoring:
                 "Input Monitoring required"
+            case .keyboardInputMonitoringUnavailable:
+                "Keyboard input source unavailable"
             case .keyboardBacklightUnavailable:
                 "Keyboard backlight unavailable"
             case .displayBrightnessUnavailable:

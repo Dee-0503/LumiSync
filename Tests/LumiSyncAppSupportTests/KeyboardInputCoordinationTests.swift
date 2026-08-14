@@ -29,6 +29,17 @@ final class KeyboardInputCoordinationTests: XCTestCase {
         XCTAssertTrue(coordinator.snapshot.keyboardInputMonitoringActive)
     }
 
+    func testGrantedPermissionWithUnavailableTapDoesNotClaimListenerActive() {
+        let keyboardInputMonitor = FakeKeyboardInputMonitor()
+        keyboardInputMonitor.startError = KeyboardInputMonitoringError.eventTapUnavailable
+        let coordinator = makeCoordinator(keyboardInputMonitor: keyboardInputMonitor)
+
+        coordinator.start()
+
+        XCTAssertFalse(coordinator.snapshot.keyboardInputMonitoringActive)
+        XCTAssertEqual(coordinator.snapshot.status, .stopped(.keyboardInputMonitoringUnavailable))
+    }
+
     func testExternalInputTurnsOffBuiltInBacklightAndBuiltInInputRestoresIt() {
         let keyboard = RecordingKeyboardBacklightController()
         let keyboardInputMonitor = FakeKeyboardInputMonitor()
@@ -110,7 +121,7 @@ final class KeyboardInputCoordinationTests: XCTestCase {
         XCTAssertGreaterThan(keyboard.values.last ?? 0, 0)
     }
 
-    func testStopStopsListeningAndCancelsReconciliation() {
+    func testStopClearsExternalStateAndCancelsReconciliation() {
         let keyboardInputMonitor = FakeKeyboardInputMonitor()
         let scheduler = FakeReconciliationScheduler()
         let coordinator = makeCoordinator(
@@ -118,12 +129,100 @@ final class KeyboardInputCoordinationTests: XCTestCase {
             scheduler: scheduler
         )
         coordinator.start()
+        keyboardInputMonitor.send(.external(KeyboardDeviceID(
+            transport: "USB",
+            vendorID: 1,
+            productID: 2,
+            locationID: 3
+        )))
+        XCTAssertTrue(coordinator.snapshot.externalKeyboardActive)
 
         coordinator.stop()
 
         XCTAssertEqual(keyboardInputMonitor.stopCount, 1)
         XCTAssertEqual(scheduler.cancelCount, 1)
         XCTAssertFalse(coordinator.snapshot.keyboardInputMonitoringActive)
+        XCTAssertFalse(coordinator.snapshot.externalKeyboardActive)
+    }
+
+    func testRuntimePermissionRevocationStopsAndClearsExternalState() {
+        let inputMonitoring = MutableInputMonitoringController(status: .granted)
+        let keyboardInputMonitor = FakeKeyboardInputMonitor()
+        let coordinator = makeCoordinator(
+            inputMonitoring: inputMonitoring,
+            keyboardInputMonitor: keyboardInputMonitor
+        )
+        coordinator.start()
+        keyboardInputMonitor.send(.external(KeyboardDeviceID(
+            transport: "USB",
+            vendorID: 1,
+            productID: 2,
+            locationID: 3
+        )))
+        inputMonitoring.status = .denied
+
+        keyboardInputMonitor.sendRuntimeEvent(.permissionRevoked)
+
+        XCTAssertFalse(coordinator.snapshot.keyboardInputMonitoringActive)
+        XCTAssertFalse(coordinator.snapshot.externalKeyboardActive)
+        XCTAssertEqual(coordinator.snapshot.inputMonitoringStatus, .denied)
+        XCTAssertEqual(coordinator.snapshot.status, .stopped(.missingInputMonitoring))
+    }
+
+    func testDisabledTapStopsListeningAndDoesNotClaimActive() {
+        let keyboardInputMonitor = FakeKeyboardInputMonitor()
+        let coordinator = makeCoordinator(keyboardInputMonitor: keyboardInputMonitor)
+        coordinator.start()
+
+        keyboardInputMonitor.sendRuntimeEvent(.tapDisabledByTimeout)
+
+        XCTAssertFalse(coordinator.snapshot.keyboardInputMonitoringActive)
+        XCTAssertEqual(coordinator.snapshot.status, .stopped(.keyboardInputMonitoringUnavailable))
+    }
+
+    func testLockStopsMonitoringAndUnlockRestartsWhenAuthorized() {
+        let keyboardInputMonitor = FakeKeyboardInputMonitor()
+        let scheduler = FakeReconciliationScheduler()
+        let coordinator = makeCoordinator(
+            keyboardInputMonitor: keyboardInputMonitor,
+            scheduler: scheduler
+        )
+        coordinator.start()
+        keyboardInputMonitor.send(.external(KeyboardDeviceID(
+            transport: "USB",
+            vendorID: 1,
+            productID: 2,
+            locationID: 3
+        )))
+
+        coordinator.handleWorkspaceEvent(.sessionLocked)
+
+        XCTAssertFalse(coordinator.snapshot.keyboardInputMonitoringActive)
+        XCTAssertFalse(coordinator.snapshot.externalKeyboardActive)
+        XCTAssertEqual(keyboardInputMonitor.stopCount, 1)
+
+        coordinator.handleWorkspaceEvent(.sessionUnlocked)
+
+        XCTAssertTrue(coordinator.snapshot.keyboardInputMonitoringActive)
+        XCTAssertEqual(keyboardInputMonitor.startCount, 2)
+    }
+
+    func testSleepStopsMonitoringAndWakeDoesNotRestartWithoutPermission() {
+        let inputMonitoring = MutableInputMonitoringController(status: .granted)
+        let keyboardInputMonitor = FakeKeyboardInputMonitor()
+        let coordinator = makeCoordinator(
+            inputMonitoring: inputMonitoring,
+            keyboardInputMonitor: keyboardInputMonitor
+        )
+        coordinator.start()
+
+        coordinator.handleWorkspaceEvent(.systemWillSleep)
+        inputMonitoring.status = .denied
+        coordinator.handleWorkspaceEvent(.systemDidWake)
+
+        XCTAssertFalse(coordinator.snapshot.keyboardInputMonitoringActive)
+        XCTAssertEqual(keyboardInputMonitor.startCount, 1)
+        XCTAssertEqual(coordinator.snapshot.status, .stopped(.missingInputMonitoring))
     }
 
     func testUnavailableBacklightTracksExternalStateWithoutClaimingWrite() {
@@ -177,22 +276,35 @@ final class KeyboardInputCoordinationTests: XCTestCase {
 
 private final class FakeKeyboardInputMonitor: KeyboardInputMonitoring {
     private var handler: (@MainActor @Sendable (KeyboardInputOrigin) -> Void)?
+    private var runtimeEventHandler: (@MainActor @Sendable (KeyboardInputMonitorRuntimeEvent) -> Void)?
+    var startError: Error?
     private(set) var startCount = 0
     private(set) var stopCount = 0
 
-    func start(handler: @escaping @MainActor @Sendable (KeyboardInputOrigin) -> Void) throws {
+    func start(
+        handler: @escaping @MainActor @Sendable (KeyboardInputOrigin) -> Void,
+        runtimeEventHandler: @escaping @MainActor @Sendable (KeyboardInputMonitorRuntimeEvent) -> Void
+    ) throws {
         startCount += 1
+        if let startError { throw startError }
         self.handler = handler
+        self.runtimeEventHandler = runtimeEventHandler
     }
 
     func stop() {
         stopCount += 1
         handler = nil
+        runtimeEventHandler = nil
     }
 
     @MainActor
     func send(_ origin: KeyboardInputOrigin) {
         handler?(origin)
+    }
+
+    @MainActor
+    func sendRuntimeEvent(_ event: KeyboardInputMonitorRuntimeEvent) {
+        runtimeEventHandler?(event)
     }
 }
 

@@ -5,16 +5,19 @@ import LumiSyncCore
 
 /// A privacy-minimized keyboard source monitor.
 ///
-/// The CGEvent tap is listen-only and discards every event payload. IOHIDManager is used
-/// only to associate activity with a keyboard device; the HID value, keycode, character,
-/// and input sequence are never inspected, retained, or forwarded.
+/// A physical keyboard press is staged from IOHIDManager using only its Boolean pressed
+/// state and device identity. It is reported only after the listen-only CGEventTap confirms
+/// a corresponding keyDown. The key usage, keycode, character, and input sequence are never
+/// stored or forwarded; ambiguous or unmatched activity is dropped fail-closed.
 public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring {
     private let permissionStatus: @Sendable () -> InputMonitoringStatus
     private var eventTap: CFMachPort?
     private var eventTapSource: CFRunLoopSource?
     private var hidManager: IOHIDManager?
     private var handler: (@MainActor @Sendable (KeyboardInputOrigin) -> Void)?
+    private var runtimeEventHandler: (@MainActor @Sendable (KeyboardInputMonitorRuntimeEvent) -> Void)?
     private var recordsByDevice: [IOHIDDevice: KeyboardDeviceRecord] = [:]
+    private var inputGate = KeyboardInputEventGate()
 
     public init(
         permissionStatus: @escaping @Sendable () -> InputMonitoringStatus = {
@@ -27,7 +30,8 @@ public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring {
     }
 
     public func start(
-        handler: @escaping @MainActor @Sendable (KeyboardInputOrigin) -> Void
+        handler: @escaping @MainActor @Sendable (KeyboardInputOrigin) -> Void,
+        runtimeEventHandler: @escaping @MainActor @Sendable (KeyboardInputMonitorRuntimeEvent) -> Void
     ) throws {
         guard permissionStatus() == .granted else {
             throw KeyboardInputMonitoringError.inputMonitoringNotAuthorized
@@ -35,6 +39,7 @@ public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring {
         guard eventTap == nil else { return }
 
         self.handler = handler
+        self.runtimeEventHandler = runtimeEventHandler
         configureHIDManager()
 
         let mask = CGEventMask(1) << CGEventType.keyDown.rawValue
@@ -44,7 +49,7 @@ public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring {
             options: .listenOnly,
             eventsOfInterest: mask,
             callback: Self.eventTapCallback,
-            userInfo: nil
+            userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else {
             stop()
             throw KeyboardInputMonitoringError.eventTapUnavailable
@@ -73,7 +78,9 @@ public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring {
         }
         hidManager = nil
         recordsByDevice.removeAll()
+        inputGate.invalidatePendingInput()
         handler = nil
+        runtimeEventHandler = nil
     }
 
     deinit {
@@ -116,21 +123,62 @@ public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring {
         recordsByDevice.removeValue(forKey: device)
     }
 
-    private func receiveActivity(from device: IOHIDDevice) {
+    private func receiveActivity(from value: IOHIDValue) {
+        let element = IOHIDValueGetElement(value)
+        guard IOHIDElementGetType(element) == kIOHIDElementTypeInput_Button else { return }
+        let device = IOHIDElementGetDevice(element)
         guard let record = recordsByDevice[device] ?? KeyboardDeviceRecord(device: device) else {
             return
         }
         let origin: KeyboardInputOrigin = record.isBuiltIn
             ? .builtIn
             : .external(record.deviceID)
-        Task { @MainActor [handler] in
-            handler?(origin)
+        inputGate.recordDeviceTransition(
+            origin: origin,
+            isPressed: IOHIDValueGetIntegerValue(value) != 0
+        )
+    }
+
+    private func receiveTapEvent(_ type: CGEventType) {
+        switch type {
+        case .keyDown:
+            guard permissionStatus() == .granted else {
+                inputGate.invalidatePendingInput()
+                notifyRuntimeEvent(.permissionRevoked)
+                return
+            }
+            guard let origin = inputGate.consumeKeyDown() else { return }
+            Task { @MainActor [handler] in
+                handler?(origin)
+            }
+        case .tapDisabledByTimeout:
+            inputGate.invalidatePendingInput()
+            notifyRuntimeEvent(.tapDisabledByTimeout)
+        case .tapDisabledByUserInput:
+            inputGate.invalidatePendingInput()
+            notifyRuntimeEvent(
+                permissionStatus() == .granted
+                    ? .tapDisabledByUserInput
+                    : .permissionRevoked
+            )
+        default:
+            break
         }
     }
 
-    private static let eventTapCallback: CGEventTapCallBack = { _, _, event, _ in
-        // Listen-only permission probe and liveness source. Deliberately do not inspect event.
-        Unmanaged.passUnretained(event)
+    private func notifyRuntimeEvent(_ event: KeyboardInputMonitorRuntimeEvent) {
+        Task { @MainActor [runtimeEventHandler] in
+            runtimeEventHandler?(event)
+        }
+    }
+
+    private static let eventTapCallback: CGEventTapCallBack = { _, type, event, userInfo in
+        guard let userInfo else { return Unmanaged.passUnretained(event) }
+        Unmanaged<SystemKeyboardInputMonitor>
+            .fromOpaque(userInfo)
+            .takeUnretainedValue()
+            .receiveTapEvent(type)
+        return Unmanaged.passUnretained(event)
     }
 
     private static let deviceMatchedCallback: IOHIDDeviceCallback = { context, _, _, device in
@@ -151,12 +199,10 @@ public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring {
 
     private static let inputValueCallback: IOHIDValueCallback = { context, _, _, value in
         guard let context else { return }
-        let device = IOHIDElementGetDevice(IOHIDValueGetElement(value))
-        // The value itself is deliberately ignored; only its originating device is used.
         Unmanaged<SystemKeyboardInputMonitor>
             .fromOpaque(context)
             .takeUnretainedValue()
-            .receiveActivity(from: device)
+            .receiveActivity(from: value)
     }
 }
 

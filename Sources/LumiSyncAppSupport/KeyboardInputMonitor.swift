@@ -6,11 +6,18 @@ public enum KeyboardInputMonitoringError: Error, Equatable {
     case eventTapUnavailable
 }
 
+public enum KeyboardInputMonitorRuntimeEvent: Equatable, Sendable {
+    case tapDisabledByTimeout
+    case tapDisabledByUserInput
+    case permissionRevoked
+}
+
 /// Reports only the originating keyboard class and non-sensitive device identity.
 /// Implementations must not expose or retain keycodes, characters, or input sequences.
 public protocol KeyboardInputMonitoring: AnyObject {
     func start(
-        handler: @escaping @MainActor @Sendable (KeyboardInputOrigin) -> Void
+        handler: @escaping @MainActor @Sendable (KeyboardInputOrigin) -> Void,
+        runtimeEventHandler: @escaping @MainActor @Sendable (KeyboardInputMonitorRuntimeEvent) -> Void
     ) throws
     func stop()
 }
