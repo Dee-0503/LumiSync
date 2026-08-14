@@ -16,7 +16,7 @@ public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring {
     private var eventTapSource: CFRunLoopSource?
     private var hidManager: IOHIDManager?
     private var callbackContext: KeyboardInputNativeCallbackContext?
-    private var callbackContextReference: Unmanaged<KeyboardInputNativeCallbackContext>?
+    private var callbackToken: UnsafeMutableRawPointer?
 
     public convenience init() {
         self.init(nativeAPI: .live)
@@ -41,13 +41,13 @@ public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring {
             handler: handler,
             runtimeEventHandler: runtimeEventHandler
         )
-        let contextReference = Unmanaged.passRetained(context)
+        let callbackToken = KeyboardInputNativeCallbackRegistry.shared.register(context)
         callbackContext = context
-        callbackContextReference = contextReference
+        self.callbackToken = callbackToken
 
         do {
-            try configureHIDManager(context: contextReference.toOpaque())
-            try configureEventTap(context: contextReference.toOpaque())
+            try configureHIDManager(context: callbackToken)
+            try configureEventTap(context: callbackToken)
         } catch {
             teardownNativeResources()
             throw error
@@ -109,7 +109,7 @@ public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring {
 
     private func teardownNativeResources() {
         guard callbackContext != nil
-                || callbackContextReference != nil
+                || callbackToken != nil
                 || hidManager != nil
                 || eventTap != nil else {
             return
@@ -136,43 +136,36 @@ public final class SystemKeyboardInputMonitor: KeyboardInputMonitoring {
         }
         hidManager = nil
 
-        callbackContext?.synchronizeWithCallbacks()
+        if let callbackToken {
+            KeyboardInputNativeCallbackRegistry.shared.retire(callbackToken)
+        }
+        self.callbackToken = nil
         callbackContext = nil
-        callbackContextReference?.release()
-        callbackContextReference = nil
     }
 
-    private static let eventTapCallback: CGEventTapCallBack = { _, type, event, userInfo in
-        guard let userInfo else { return Unmanaged.passUnretained(event) }
-        Unmanaged<KeyboardInputNativeCallbackContext>
-            .fromOpaque(userInfo)
-            .takeUnretainedValue()
-            .receiveTapEvent(type)
+    private static let eventTapCallback: CGEventTapCallBack = { _, type, event, token in
+        KeyboardInputNativeCallbackTrampoline.withContext(token: token) { context in
+            context.receiveTapEvent(type)
+        }
         return Unmanaged.passUnretained(event)
     }
 
-    private static let deviceMatchedCallback: IOHIDDeviceCallback = { context, _, _, device in
-        guard let context else { return }
-        Unmanaged<KeyboardInputNativeCallbackContext>
-            .fromOpaque(context)
-            .takeUnretainedValue()
-            .deviceMatched(device)
+    private static let deviceMatchedCallback: IOHIDDeviceCallback = { token, _, _, device in
+        KeyboardInputNativeCallbackTrampoline.withContext(token: token) { context in
+            context.deviceMatched(device)
+        }
     }
 
-    private static let deviceRemovedCallback: IOHIDDeviceCallback = { context, _, _, device in
-        guard let context else { return }
-        Unmanaged<KeyboardInputNativeCallbackContext>
-            .fromOpaque(context)
-            .takeUnretainedValue()
-            .deviceRemoved(device)
+    private static let deviceRemovedCallback: IOHIDDeviceCallback = { token, _, _, device in
+        KeyboardInputNativeCallbackTrampoline.withContext(token: token) { context in
+            context.deviceRemoved(device)
+        }
     }
 
-    private static let inputValueCallback: IOHIDValueCallback = { context, _, _, value in
-        guard let context else { return }
-        Unmanaged<KeyboardInputNativeCallbackContext>
-            .fromOpaque(context)
-            .takeUnretainedValue()
-            .receiveActivity(from: value)
+    private static let inputValueCallback: IOHIDValueCallback = { token, _, _, value in
+        KeyboardInputNativeCallbackTrampoline.withContext(token: token) { context in
+            context.receiveActivity(from: value)
+        }
     }
 }
 
@@ -272,10 +265,6 @@ final class KeyboardInputNativeCallbackContext: @unchecked Sendable {
             handler = nil
             runtimeEventHandler = nil
         }
-    }
-
-    func synchronizeWithCallbacks() {
-        lock.withLock {}
     }
 
     func deviceMatched(_ device: IOHIDDevice) {

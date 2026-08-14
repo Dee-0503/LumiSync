@@ -85,6 +85,89 @@ final class SystemKeyboardInputMonitorLifecycleTests: XCTestCase {
 
         XCTAssertEqual(deliveredOrigins, [.builtIn])
     }
+
+    func testRetireWaitsForLeaseAcquiredBeforeContextMethod() {
+        let registry = KeyboardInputNativeCallbackRegistry.shared
+        let context = makeContext()
+        let token = registry.register(context)
+        let tokenBits = UInt(bitPattern: token)
+        let acquired = DispatchSemaphore(value: 0)
+        let resume = DispatchSemaphore(value: 0)
+        let retired = DispatchSemaphore(value: 0)
+
+        DispatchQueue.global().async {
+            let rawToken = UnsafeMutableRawPointer(bitPattern: tokenBits)
+            guard let lease = registry.acquire(rawToken, afterIncrement: {
+                acquired.signal()
+                resume.wait()
+            }) else {
+                return
+            }
+            lease.context.recordActivity(origin: .builtIn, nowNanoseconds: 1)
+            lease.release()
+        }
+        XCTAssertEqual(acquired.wait(timeout: .now() + 1), .success)
+
+        DispatchQueue.global().async {
+            if let rawToken = UnsafeMutableRawPointer(bitPattern: tokenBits) {
+                registry.retire(rawToken)
+            }
+            retired.signal()
+        }
+        XCTAssertEqual(retired.wait(timeout: .now() + 0.05), .timedOut)
+        resume.signal()
+        XCTAssertEqual(retired.wait(timeout: .now() + 1), .success)
+        XCTAssertNil(registry.acquire(UnsafeMutableRawPointer(bitPattern: tokenBits)))
+    }
+
+    func testRetireCannotPassAcquisitionWhileRegistryLockIsHeld() {
+        let registry = KeyboardInputNativeCallbackRegistry.shared
+        let token = registry.register(makeContext())
+        let tokenBits = UInt(bitPattern: token)
+        let locked = DispatchSemaphore(value: 0)
+        let resume = DispatchSemaphore(value: 0)
+        let retired = DispatchSemaphore(value: 0)
+        registry.whileRegistryLocked = {
+            locked.signal()
+            resume.wait()
+        }
+
+        DispatchQueue.global().async {
+            let lease = registry.acquire(UnsafeMutableRawPointer(bitPattern: tokenBits))
+            lease?.release()
+        }
+        XCTAssertEqual(locked.wait(timeout: .now() + 1), .success)
+        DispatchQueue.global().async {
+            if let rawToken = UnsafeMutableRawPointer(bitPattern: tokenBits) {
+                registry.retire(rawToken)
+            }
+            retired.signal()
+        }
+        XCTAssertEqual(retired.wait(timeout: .now() + 0.05), .timedOut)
+        registry.whileRegistryLocked = nil
+        resume.signal()
+        XCTAssertEqual(retired.wait(timeout: .now() + 1), .success)
+    }
+
+    func testRetiredRawTokenRejectsLateTrampolineAcquisition() {
+        let registry = KeyboardInputNativeCallbackRegistry.shared
+        let token = registry.register(makeContext())
+
+        registry.retire(token)
+
+        XCTAssertFalse(KeyboardInputNativeCallbackTrampoline.withContext(token: token) { _ in
+            XCTFail("Retired token must not reach callback context")
+        })
+    }
+
+    private func makeContext() -> KeyboardInputNativeCallbackContext {
+        KeyboardInputNativeCallbackContext(
+            permissionStatus: { .granted },
+            monotonicNanoseconds: { 1 },
+            handler: { _ in },
+            runtimeEventHandler: { _ in }
+        )
+    }
 }
 
 private final class RecordingSystemKeyboardInputNativeAPI: @unchecked Sendable {
