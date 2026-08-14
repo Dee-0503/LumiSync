@@ -24,6 +24,8 @@ public struct AppSnapshot: Equatable, Sendable {
     public var selectedSource: String
     public var fallbackReason: String?
     public var inputMonitoringStatus: InputMonitoringStatus
+    public var keyboardInputMonitoringActive: Bool
+    public var externalKeyboardActive: Bool
     public var keyboardBacklightStatus: KeyboardBacklightAvailability
     public var preferences: LumiSyncPreferences
 
@@ -38,6 +40,8 @@ public struct AppSnapshot: Equatable, Sendable {
             selectedSource: "Not available",
             fallbackReason: nil,
             inputMonitoringStatus: .notDetermined,
+            keyboardInputMonitoringActive: false,
+            externalKeyboardActive: false,
             keyboardBacklightStatus: .unavailable,
             preferences: preferences.core
         )
@@ -52,27 +56,49 @@ public final class AppStateCoordinator: ObservableObject {
     private let displayBrightnessReader: any DisplayBrightnessReadingService
     private let keyboardBacklight: any KeyboardBacklightControlling
     private let inputMonitoring: any InputMonitoringControlling
+    private let keyboardInputMonitor: (any KeyboardInputMonitoring)?
+    private let reconciliationScheduler: any ExternalKeyboardReconciliationScheduling
+    private let monotonicSeconds: () -> Int
     private let syncEngine = SyncEngine()
     private var preferences: AppPreferences
+    private var externalKeyboardPolicy: ExternalKeyboardPolicy
 
     public init(
         preferencesStore: any AppPreferencesStoring,
         displayBrightnessReader: any DisplayBrightnessReadingService,
         keyboardBacklight: any KeyboardBacklightControlling,
-        inputMonitoring: any InputMonitoringControlling
+        inputMonitoring: any InputMonitoringControlling,
+        keyboardInputMonitor: (any KeyboardInputMonitoring)? = nil,
+        reconciliationScheduler: any ExternalKeyboardReconciliationScheduling = DispatchExternalKeyboardReconciliationScheduler(),
+        monotonicSeconds: @escaping () -> Int = {
+            Int(ProcessInfo.processInfo.systemUptime)
+        }
     ) {
         let loadedPreferences = (try? preferencesStore.load()) ?? .defaults
         self.preferencesStore = preferencesStore
         self.displayBrightnessReader = displayBrightnessReader
         self.keyboardBacklight = keyboardBacklight
         self.inputMonitoring = inputMonitoring
+        self.keyboardInputMonitor = keyboardInputMonitor
+        self.reconciliationScheduler = reconciliationScheduler
+        self.monotonicSeconds = monotonicSeconds
         preferences = loadedPreferences
+        externalKeyboardPolicy = ExternalKeyboardPolicy(
+            excludedDevices: loadedPreferences.core.excludedKeyboardDevices
+        )
         snapshot = AppSnapshot.initial(preferences: loadedPreferences)
         updateCapabilityStatus()
     }
 
     public func start() {
         refresh()
+        updateKeyboardInputMonitoring()
+    }
+
+    public func stop() {
+        keyboardInputMonitor?.stop()
+        reconciliationScheduler.cancel()
+        snapshot.keyboardInputMonitoringActive = false
     }
 
     public func refresh() {
@@ -84,9 +110,12 @@ public final class AppStateCoordinator: ObservableObject {
         }
 
         guard snapshot.inputMonitoringStatus == .granted else {
+            stopKeyboardInputMonitoring()
             snapshot.status = .stopped(.missingInputMonitoring)
             return
         }
+
+        updateKeyboardInputMonitoring()
 
         guard snapshot.keyboardBacklightStatus == .available else {
             snapshot.status = .stopped(.keyboardBacklightUnavailable)
@@ -165,6 +194,66 @@ public final class AppStateCoordinator: ObservableObject {
         snapshot.keyboardBacklightStatus = keyboardBacklight.availability
         snapshot.preferences = preferences.core
         snapshot.isPaused = preferences.isPaused
+        snapshot.externalKeyboardActive = externalKeyboardPolicy.isExternalKeyboardActive
+    }
+
+    private func updateKeyboardInputMonitoring() {
+        guard snapshot.inputMonitoringStatus == .granted,
+              let keyboardInputMonitor,
+              !snapshot.keyboardInputMonitoringActive else {
+            return
+        }
+
+        do {
+            try keyboardInputMonitor.start { [weak self] origin in
+                self?.recordKeyboardInput(origin)
+            }
+            snapshot.keyboardInputMonitoringActive = true
+        } catch {
+            snapshot.keyboardInputMonitoringActive = false
+            snapshot.status = .stopped(.missingInputMonitoring)
+        }
+    }
+
+    private func stopKeyboardInputMonitoring() {
+        guard snapshot.keyboardInputMonitoringActive else { return }
+        keyboardInputMonitor?.stop()
+        reconciliationScheduler.cancel()
+        snapshot.keyboardInputMonitoringActive = false
+    }
+
+    private func recordKeyboardInput(_ origin: KeyboardInputOrigin) {
+        let wasExternal = externalKeyboardPolicy.isExternalKeyboardActive
+        externalKeyboardPolicy.recordInput(origin, seconds: monotonicSeconds())
+        snapshot.externalKeyboardActive = externalKeyboardPolicy.isExternalKeyboardActive
+
+        if externalKeyboardPolicy.isExternalKeyboardActive {
+            scheduleExternalKeyboardReconciliation()
+        } else {
+            reconciliationScheduler.cancel()
+        }
+
+        if wasExternal != externalKeyboardPolicy.isExternalKeyboardActive
+            || externalKeyboardPolicy.isExternalKeyboardActive {
+            reconcile()
+        }
+    }
+
+    private func scheduleExternalKeyboardReconciliation() {
+        reconciliationScheduler.schedule(after: 900) { [weak self] in
+            self?.reconcileExternalKeyboardTimeout()
+        }
+    }
+
+    private func reconcileExternalKeyboardTimeout() {
+        externalKeyboardPolicy.tick(seconds: monotonicSeconds())
+        snapshot.externalKeyboardActive = externalKeyboardPolicy.isExternalKeyboardActive
+        if externalKeyboardPolicy.isExternalKeyboardActive {
+            scheduleExternalKeyboardReconciliation()
+            return
+        }
+        reconciliationScheduler.cancel()
+        reconcile()
     }
 
     private func reconcile() {
@@ -174,9 +263,12 @@ public final class AppStateCoordinator: ObservableObject {
         }
 
         guard snapshot.inputMonitoringStatus == .granted else {
+            stopKeyboardInputMonitoring()
             snapshot.status = .stopped(.missingInputMonitoring)
             return
         }
+
+        updateKeyboardInputMonitoring()
 
         guard snapshot.keyboardBacklightStatus == .available else {
             snapshot.status = .stopped(.keyboardBacklightUnavailable)
@@ -198,7 +290,7 @@ public final class AppStateCoordinator: ObservableObject {
             displayAsleep: snapshot.displayAsleep,
             systemAsleep: snapshot.systemAsleep,
             effectiveDisplayBrightness: snapshot.displayBrightness ?? 0,
-            externalKeyboardActive: false,
+            externalKeyboardActive: externalKeyboardPolicy.isExternalKeyboardActive,
             paused: false,
             curve: curve,
             intensity: preferences.core.intensity

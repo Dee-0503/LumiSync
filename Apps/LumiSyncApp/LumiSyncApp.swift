@@ -49,27 +49,32 @@ final class AppModel: ObservableObject {
 
     let coordinator: AppStateCoordinator
     private let lifecycleMonitor: WorkspaceLifecycleMonitor
+    private let keyboardInputMonitor: SystemKeyboardInputMonitor?
 
     init(
-        coordinator: AppStateCoordinator = AppStateCoordinator(
+        coordinator: AppStateCoordinator? = nil,
+        lifecycleMonitor: WorkspaceLifecycleMonitor = WorkspaceLifecycleMonitor()
+    ) {
+        let keyboardInputMonitor = coordinator == nil ? SystemKeyboardInputMonitor() : nil
+        let resolvedCoordinator = coordinator ?? AppStateCoordinator(
             preferencesStore: UserDefaultsAppPreferencesStore(),
             displayBrightnessReader: PublicDisplayBrightnessReader(),
             keyboardBacklight: UnavailableKeyboardBacklightController(),
-            inputMonitoring: SystemInputMonitoringController()
-        ),
-        lifecycleMonitor: WorkspaceLifecycleMonitor = WorkspaceLifecycleMonitor()
-    ) {
-        self.coordinator = coordinator
+            inputMonitoring: SystemInputMonitoringController(),
+            keyboardInputMonitor: keyboardInputMonitor
+        )
+        self.coordinator = resolvedCoordinator
         self.lifecycleMonitor = lifecycleMonitor
-        snapshot = coordinator.snapshot
+        self.keyboardInputMonitor = keyboardInputMonitor
+        snapshot = resolvedCoordinator.snapshot
 
         lifecycleMonitor.onEvent = { [weak self] event in
             self?.coordinator.handleWorkspaceEvent(event)
-            self?.snapshot = coordinator.snapshot
+            self?.snapshot = resolvedCoordinator.snapshot
         }
         lifecycleMonitor.start()
-        coordinator.start()
-        snapshot = coordinator.snapshot
+        resolvedCoordinator.start()
+        snapshot = resolvedCoordinator.snapshot
     }
 
     var menuBarSystemImage: String {

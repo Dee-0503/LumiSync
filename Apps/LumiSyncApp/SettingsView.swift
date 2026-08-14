@@ -34,7 +34,8 @@ struct SettingsView: View {
 
             Section("Input Monitoring") {
                 LabeledContent("Permission", value: inputMonitoringDescription)
-                Text("LumiSync only checks the permission state and provides the request entry point. It does not record key contents.")
+                LabeledContent("Source listener", value: keyboardInputListenerDescription)
+                Text("LumiSync identifies only the originating keyboard and its non-sensitive device identity. It never records keycodes, characters, key contents, or input sequences.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 HStack {
@@ -94,6 +95,13 @@ struct SettingsView: View {
         case .granted:
             "Granted"
         }
+    }
+
+    private var keyboardInputListenerDescription: String {
+        guard model.snapshot.inputMonitoringStatus == .granted else {
+            return "Not started"
+        }
+        return model.snapshot.keyboardInputMonitoringActive ? "Active" : "Unavailable"
     }
 
     private var keyboardBacklightDescription: String {
