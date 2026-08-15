@@ -29,6 +29,7 @@ public struct AppSnapshot: Equatable, Sendable {
     public var externalKeyboardActive: Bool
     public var keyboardBacklightStatus: KeyboardBacklightAvailability
     public var preferences: LumiSyncPreferences
+    public var language: AppLanguage
 
     public static func initial(preferences: AppPreferences) -> AppSnapshot {
         AppSnapshot(
@@ -44,7 +45,8 @@ public struct AppSnapshot: Equatable, Sendable {
             keyboardInputMonitoringActive: false,
             externalKeyboardActive: false,
             keyboardBacklightStatus: .unavailable,
-            preferences: preferences.core
+            preferences: preferences.core,
+            language: preferences.language
         )
     }
 }
@@ -164,6 +166,12 @@ public final class AppStateCoordinator: ObservableObject {
         setPaused(!preferences.isPaused)
     }
 
+    public func setLanguage(_ language: AppLanguage) {
+        preferences.language = language
+        snapshot.language = language
+        try? preferencesStore.save(preferences)
+    }
+
     public func handleWorkspaceEvent(_ event: WorkspaceEvent) {
         switch event {
         case .sessionLocked:
@@ -209,6 +217,7 @@ public final class AppStateCoordinator: ObservableObject {
         snapshot.keyboardBacklightStatus = keyboardBacklight.availability
         snapshot.preferences = preferences.core
         snapshot.isPaused = preferences.isPaused
+        snapshot.language = preferences.language
         snapshot.externalKeyboardActive = externalKeyboardPolicy.isExternalKeyboardActive
     }
 

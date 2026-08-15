@@ -20,25 +20,27 @@ struct LumiSyncApp: App {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Divider()
-                Button(model.snapshot.isPaused ? "Resume" : "Pause") {
+                Button(model.localizer.string(model.snapshot.isPaused ? "menu.resume" : "menu.pause")) {
                     model.togglePaused()
                 }
-                Button("Refresh") {
+                Button(model.localizer.string("menu.refresh")) {
                     model.refresh()
                 }
                 SettingsLink {
-                    Label("Settings…", systemImage: "gearshape")
+                    Label(model.localizer.string("menu.settings"), systemImage: "gearshape")
                 }
                 Divider()
-                Button("Quit LumiSync") {
+                Button(model.localizer.string("menu.quit")) {
                     NSApplication.shared.terminate(nil)
                 }
             }
             .padding()
+            .environment(\.locale, model.localizer.locale)
         }
 
         Settings {
             SettingsView(model: model)
+                .environment(\.locale, model.localizer.locale)
         }
     }
 }
@@ -91,33 +93,47 @@ final class AppModel: ObservableObject {
         }
     }
 
+    var localizer: AppLocalizer {
+        AppLocalizer(language: snapshot.language)
+    }
+
     var statusDescription: String {
         switch snapshot.status {
         case .active:
-            "Active"
+            localizer.string("status.active")
         case .paused:
-            "Paused"
+            localizer.string("status.paused")
         case let .stopped(reason):
             switch reason {
             case .missingInputMonitoring:
-                "Input Monitoring required"
+                localizer.string("status.inputMonitoringRequired")
             case .keyboardInputMonitoringUnavailable:
-                "Keyboard input source unavailable"
+                localizer.string("status.keyboardInputUnavailable")
             case .keyboardBacklightUnavailable:
-                "Keyboard backlight unavailable"
+                localizer.string("status.keyboardBacklightUnavailable")
             case .displayBrightnessUnavailable:
-                "Display brightness unavailable"
+                localizer.string("status.displayBrightnessUnavailable")
             case .keyboardBacklightWriteFailed:
-                "Keyboard backlight write failed"
+                localizer.string("status.keyboardWriteFailed")
             }
         }
     }
 
     var sourceDescription: String {
+        let source = localizer.displaySource(snapshot.selectedSource)
         if let brightness = snapshot.displayBrightness {
-            return "\(snapshot.selectedSource): \(brightness.formatted(.percent.precision(.fractionLength(0))))"
+            return "\(source): \(brightness.formatted(.percent.precision(.fractionLength(0))))"
         }
-        return snapshot.selectedSource
+        return source
+    }
+
+    func localizedFallbackReason(_ reason: String) -> String {
+        localizer.fallbackReason(reason)
+    }
+
+    func setLanguage(_ language: AppLanguage) {
+        coordinator.setLanguage(language)
+        snapshot = coordinator.snapshot
     }
 
     func togglePaused() {

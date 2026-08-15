@@ -1,16 +1,56 @@
 import Foundation
 import LumiSyncCore
 
+public enum AppLanguage: String, CaseIterable, Codable, Sendable {
+    case system
+    case simplifiedChinese = "zh-Hans"
+    case english = "en"
+
+    public var localeIdentifier: String? {
+        switch self {
+        case .system:
+            nil
+        case .simplifiedChinese:
+            "zh-Hans"
+        case .english:
+            "en"
+        }
+    }
+}
+
 public struct AppPreferences: Equatable, Codable, Sendable {
     public var core: LumiSyncPreferences
     public var isPaused: Bool
+    public var language: AppLanguage
 
-    public init(core: LumiSyncPreferences, isPaused: Bool) {
+    public init(
+        core: LumiSyncPreferences,
+        isPaused: Bool,
+        language: AppLanguage = .system
+    ) {
         self.core = core
         self.isPaused = isPaused
+        self.language = language
     }
 
-    public static let defaults = AppPreferences(core: .defaults, isPaused: false)
+    private enum CodingKeys: String, CodingKey {
+        case core
+        case isPaused
+        case language
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        core = try container.decode(LumiSyncPreferences.self, forKey: .core)
+        isPaused = try container.decode(Bool.self, forKey: .isPaused)
+        language = try container.decodeIfPresent(AppLanguage.self, forKey: .language) ?? .system
+    }
+
+    public static let defaults = AppPreferences(
+        core: .defaults,
+        isPaused: false,
+        language: .system
+    )
 }
 
 public protocol AppPreferencesStoring: AnyObject {

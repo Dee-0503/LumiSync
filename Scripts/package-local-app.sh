@@ -31,9 +31,15 @@ bin_path="$(swift build \
   --configuration "$CONFIGURATION" \
   --show-bin-path)"
 product_path="$bin_path/$PRODUCT_NAME"
+resource_bundle_path="$bin_path/LumiSync_LumiSyncAppSupport.bundle"
 
 if [[ ! -x "$product_path" ]]; then
   echo "SwiftPM product is missing or not executable: $product_path" >&2
+  exit 1
+fi
+
+if [[ ! -d "$resource_bundle_path" ]]; then
+  echo "SwiftPM AppSupport resource bundle is missing: $resource_bundle_path" >&2
   exit 1
 fi
 
@@ -41,6 +47,7 @@ mkdir -p "$CONTENTS_PATH/MacOS" "$CONTENTS_PATH/Resources"
 cp "$product_path" "$EXECUTABLE_PATH"
 cp "$INFO_PLIST_SOURCE" "$CONTENTS_PATH/Info.plist"
 cp -R "$RESOURCES_SOURCE/." "$CONTENTS_PATH/Resources/"
+cp -R "$resource_bundle_path" "$CONTENTS_PATH/Resources/"
 chmod 755 "$EXECUTABLE_PATH"
 
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$CONTENTS_PATH/Info.plist"

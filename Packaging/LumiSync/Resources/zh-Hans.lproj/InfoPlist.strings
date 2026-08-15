@@ -1,0 +1,1 @@
+"NSInputMonitoringUsageDescription" = "LumiSync 仅识别键盘活动来自内置键盘还是外接键盘，不会读取或存储按键内容。";

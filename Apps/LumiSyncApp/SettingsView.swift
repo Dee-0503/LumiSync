@@ -5,20 +5,24 @@ import SwiftUI
 struct SettingsView: View {
     @ObservedObject var model: AppModel
 
+    private var localizer: AppLocalizer {
+        model.localizer
+    }
+
     var body: some View {
         Form {
-            Section("Synchronization") {
-                LabeledContent("Status", value: model.statusDescription)
-                LabeledContent("Selected source", value: model.sourceDescription)
+            Section(localizer.string("settings.synchronization")) {
+                LabeledContent(localizer.string("settings.status"), value: model.statusDescription)
+                LabeledContent(localizer.string("settings.selectedSource"), value: model.sourceDescription)
 
                 if let fallbackReason = model.snapshot.fallbackReason {
-                    Text(fallbackReason)
+                    Text(model.localizedFallbackReason(fallbackReason))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
 
                 Toggle(
-                    "Pause synchronization",
+                    localizer.string("settings.pauseSynchronization"),
                     isOn: Binding(
                         get: { model.snapshot.isPaused },
                         set: { _ in model.togglePaused() }
@@ -26,31 +30,45 @@ struct SettingsView: View {
                 )
             }
 
-            Section("Configuration") {
-                LabeledContent("Preset", value: presetName)
-                LabeledContent("Intensity", value: intensityDescription)
-                LabeledContent("Exclusions", value: exclusionsDescription)
+            Section(localizer.string("settings.configuration")) {
+                Picker(
+                    localizer.string("settings.language"),
+                    selection: Binding(
+                        get: { model.snapshot.language },
+                        set: { model.setLanguage($0) }
+                    )
+                ) {
+                    Text(localizer.string("language.system"))
+                        .tag(AppLanguage.system)
+                    Text(localizer.string("language.simplifiedChinese"))
+                        .tag(AppLanguage.simplifiedChinese)
+                    Text(localizer.string("language.english"))
+                        .tag(AppLanguage.english)
+                }
+                LabeledContent(localizer.string("settings.preset"), value: presetName)
+                LabeledContent(localizer.string("settings.intensity"), value: intensityDescription)
+                LabeledContent(localizer.string("settings.exclusions"), value: exclusionsDescription)
             }
 
-            Section("Input Monitoring") {
-                LabeledContent("Permission", value: inputMonitoringDescription)
-                LabeledContent("Source listener", value: keyboardInputListenerDescription)
-                Text("LumiSync identifies only the originating keyboard and its non-sensitive device identity. It never records keycodes, characters, key contents, or input sequences.")
+            Section(localizer.string("settings.inputMonitoring")) {
+                LabeledContent(localizer.string("settings.permission"), value: inputMonitoringDescription)
+                LabeledContent(localizer.string("settings.sourceListener"), value: keyboardInputListenerDescription)
+                Text(localizer.string("settings.inputPrivacy"))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 HStack {
-                    Button("Request Access") {
+                    Button(localizer.string("settings.requestAccess")) {
                         model.requestInputMonitoring()
                     }
-                    Button("Open System Settings") {
+                    Button(localizer.string("settings.openSystemSettings")) {
                         model.openInputMonitoringSettings()
                     }
                 }
             }
 
-            Section("Keyboard Backlight") {
-                LabeledContent("Capability", value: keyboardBacklightDescription)
-                Text("No supported public macOS API is connected. LumiSync reports this capability as unavailable and never claims a successful hardware write.")
+            Section(localizer.string("settings.keyboardBacklight")) {
+                LabeledContent(localizer.string("settings.capability"), value: keyboardBacklightDescription)
+                Text(localizer.string("settings.backlightUnavailableHelp"))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -64,14 +82,14 @@ struct SettingsView: View {
         case let .preset(preset):
             switch preset {
             case .comfort:
-                "Comfort"
+                localizer.string("preset.comfort")
             case .alwaysOn:
-                "Always On"
+                localizer.string("preset.alwaysOn")
             case .energySaver:
-                "Energy Saver"
+                localizer.string("preset.energySaver")
             }
         case .custom:
-            "Custom"
+            localizer.string("preset.custom")
         }
     }
 
@@ -83,33 +101,37 @@ struct SettingsView: View {
 
     private var exclusionsDescription: String {
         let count = model.snapshot.preferences.excludedKeyboardDevices.count
-        return count == 0 ? "None" : "\(count) device\(count == 1 ? "" : "s")"
+        return count == 0
+            ? localizer.string("value.none")
+            : localizer.string("value.devices", arguments: count)
     }
 
     private var inputMonitoringDescription: String {
         switch model.snapshot.inputMonitoringStatus {
         case .notDetermined:
-            "Not determined"
+            localizer.string("permission.notDetermined")
         case .denied:
-            "Not granted"
+            localizer.string("permission.notGranted")
         case .granted:
-            "Granted"
+            localizer.string("permission.granted")
         }
     }
 
     private var keyboardInputListenerDescription: String {
         guard model.snapshot.inputMonitoringStatus == .granted else {
-            return "Not started"
+            return localizer.string("listener.notStarted")
         }
-        return model.snapshot.keyboardInputMonitoringActive ? "Active" : "Unavailable"
+        return model.snapshot.keyboardInputMonitoringActive
+            ? localizer.string("status.active")
+            : localizer.string("value.unavailable")
     }
 
     private var keyboardBacklightDescription: String {
         switch model.snapshot.keyboardBacklightStatus {
         case .available:
-            "Available"
+            localizer.string("value.available")
         case .unavailable:
-            "Unavailable"
+            localizer.string("value.unavailable")
         }
     }
 }

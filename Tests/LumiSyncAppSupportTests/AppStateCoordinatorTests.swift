@@ -23,6 +23,28 @@ final class AppStateCoordinatorTests: XCTestCase {
         XCTAssertTrue(keyboard.values.isEmpty)
     }
 
+    func testLanguageChangePublishesAndPersistsImmediately() throws {
+        let preferencesStore = InMemoryAppPreferencesStore()
+        let coordinator = AppStateCoordinator(
+            preferencesStore: preferencesStore,
+            displayBrightnessReader: StubDisplayBrightnessReader(result: .success(
+                DisplayBrightnessReading(value: 0.2, sourceDescription: "Built-in display")
+            )),
+            keyboardBacklight: UnavailableKeyboardBacklightController(),
+            inputMonitoring: StubInputMonitoringController(status: .granted)
+        )
+        var observedLanguage: AppLanguage?
+        coordinator.onSnapshotChange = { snapshot in
+            observedLanguage = snapshot.language
+        }
+
+        coordinator.setLanguage(.simplifiedChinese)
+
+        XCTAssertEqual(coordinator.snapshot.language, .simplifiedChinese)
+        XCTAssertEqual(observedLanguage, .simplifiedChinese)
+        XCTAssertEqual(try preferencesStore.load().language, .simplifiedChinese)
+    }
+
     func testUnavailableKeyboardCapabilityIsReportedWithoutClaimingSuccess() {
         let coordinator = AppStateCoordinator(
             preferencesStore: InMemoryAppPreferencesStore(),

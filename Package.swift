@@ -3,6 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "LumiSync",
+    defaultLocalization: "en",
     platforms: [.macOS(.v14)],
     products: [
         .library(name: "LumiSyncCore", targets: ["LumiSyncCore"]),
@@ -17,6 +18,7 @@ let package = Package(
         .target(
             name: "LumiSyncAppSupport",
             dependencies: ["LumiSyncCore"],
+            resources: [.process("Resources")],
             linkerSettings: [
                 .linkedFramework("ApplicationServices"),
                 .linkedFramework("IOKit")
