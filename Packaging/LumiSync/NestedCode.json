@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "executables": [
+    {
+      "path": "Contents/MacOS/LumiSync",
+      "product": "LumiSyncApp",
+      "role": "app"
+    },
+    {
+      "path": "Contents/Helpers/lumisync-backlight-controller",
+      "product": "lumisync-backlight-controller",
+      "role": "controller"
+    },
+    {
+      "path": "Contents/Helpers/lumisync-backlight-supervisor",
+      "product": "lumisync-backlight-supervisor",
+      "role": "supervisor"
+    },
+    {
+      "path": "Contents/Helpers/lumisync-backlight-writer",
+      "product": "lumisync-backlight-writer",
+      "role": "writer"
+    }
+  ]
+}
