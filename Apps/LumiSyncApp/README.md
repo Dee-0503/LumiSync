@@ -1,14 +1,7 @@
-# LumiSync App Scaffold
+# LumiSync App
 
-This directory defines the native macOS application boundary for the future
-Xcode project. Add `LumiSyncApp.swift` and `SettingsView.swift` to a macOS 14+
-app target, then link that target to the `LumiSyncCore` Swift package product.
+This directory is the SwiftPM executable target for a native macOS 14+ menu-bar application. Build it with `swift build --product LumiSyncApp` and run the generated executable directly during local development; no paid Apple Developer account, signing identity, privileged helper, or notarization asset is required.
 
-The scaffold provides a menu-bar scene and a settings scene. It consumes the
-versioned default preferences from `LumiSyncCore` and presents placeholder
-diagnostics until the device monitors and Helper client are connected.
+The app links `LumiSyncCore` through `LumiSyncAppSupport`. It reads the active display brightness through public CoreGraphics/IOKit APIs, observes lock, display-sleep, system-sleep, wake, and unlock notifications, persists pause state plus core preferences in `UserDefaults`, and exposes pause/resume from the menu bar.
 
-No hardware access is implemented here. The App must communicate with the
-privileged Helper through the narrow interface documented in
-`Helpers/LumiSyncHelper`, and keyboard-backlight control must not be connected
-until `docs/feasibility/keyboard-backlight.md` passes on target hardware.
+Input Monitoring is limited to checking/requesting the macOS permission and opening System Settings. No event tap is installed and no key contents are recorded. Keyboard-backlight control uses `KeyboardBacklightControlling`; the production default is `UnavailableKeyboardBacklightController`, so the app visibly reports unavailable instead of pretending a hardware write succeeded.

@@ -1,80 +1,137 @@
+import LumiSyncAppSupport
 import LumiSyncCore
 import SwiftUI
 
-struct SettingsSnapshot: Sendable {
-    enum PermissionState: String, Sendable {
-        case granted = "Granted"
-        case denied = "Denied"
-        case notDetermined = "Not determined"
-    }
-
-    let status: String
-    let selectedSource: String
-    let fallbackReason: String?
-    let preferences: LumiSyncPreferences
-    let inputMonitoringPermission: PermissionState
-    let helperAuthorization: PermissionState
-}
-
 struct SettingsView: View {
-    let snapshot: SettingsSnapshot
+    @ObservedObject var model: AppModel
+
+    private var localizer: AppLocalizer {
+        model.localizer
+    }
 
     var body: some View {
         Form {
-            Section("Synchronization") {
-                LabeledContent("Status", value: snapshot.status)
-                LabeledContent("Selected source", value: snapshot.selectedSource)
+            Section(localizer.string("settings.synchronization")) {
+                LabeledContent(localizer.string("settings.status"), value: model.statusDescription)
+                LabeledContent(localizer.string("settings.selectedSource"), value: model.sourceDescription)
 
-                if let fallbackReason = snapshot.fallbackReason {
-                    LabeledContent("Fallback reason", value: fallbackReason)
+                if let fallbackReason = model.snapshot.fallbackReason {
+                    Text(model.localizedFallbackReason(fallbackReason))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Toggle(
+                    localizer.string("settings.pauseSynchronization"),
+                    isOn: Binding(
+                        get: { model.snapshot.isPaused },
+                        set: { _ in model.togglePaused() }
+                    )
+                )
+            }
+
+            Section(localizer.string("settings.configuration")) {
+                Picker(
+                    localizer.string("settings.language"),
+                    selection: Binding(
+                        get: { model.snapshot.language },
+                        set: { model.setLanguage($0) }
+                    )
+                ) {
+                    Text(localizer.string("language.system"))
+                        .tag(AppLanguage.system)
+                    Text(localizer.string("language.simplifiedChinese"))
+                        .tag(AppLanguage.simplifiedChinese)
+                    Text(localizer.string("language.english"))
+                        .tag(AppLanguage.english)
+                }
+                LabeledContent(localizer.string("settings.preset"), value: presetName)
+                LabeledContent(localizer.string("settings.intensity"), value: intensityDescription)
+                LabeledContent(localizer.string("settings.exclusions"), value: exclusionsDescription)
+            }
+
+            Section(localizer.string("settings.inputMonitoring")) {
+                LabeledContent(localizer.string("settings.permission"), value: inputMonitoringDescription)
+                LabeledContent(localizer.string("settings.sourceListener"), value: keyboardInputListenerDescription)
+                Text(localizer.string("settings.inputPrivacy"))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Button(localizer.string("settings.requestAccess")) {
+                        model.requestInputMonitoring()
+                    }
+                    Button(localizer.string("settings.openSystemSettings")) {
+                        model.openInputMonitoringSettings()
+                    }
                 }
             }
 
-            Section("Configuration") {
-                LabeledContent("Preset", value: presetName)
-                LabeledContent("Intensity", value: intensityDescription)
-                LabeledContent("Exclusions", value: exclusionsDescription)
-            }
-
-            Section("Permissions") {
-                LabeledContent(
-                    "Input Monitoring permission",
-                    value: snapshot.inputMonitoringPermission.rawValue
-                )
-                LabeledContent(
-                    "Helper authorization",
-                    value: snapshot.helperAuthorization.rawValue
-                )
+            Section(localizer.string("settings.keyboardBacklight")) {
+                LabeledContent(localizer.string("settings.capability"), value: keyboardBacklightDescription)
+                Text(localizer.string("settings.backlightUnavailableHelp"))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
-        .frame(minWidth: 520, minHeight: 360)
+        .frame(minWidth: 560, minHeight: 420)
     }
 
     private var presetName: String {
-        switch snapshot.preferences.curveSelection {
+        switch model.snapshot.preferences.curveSelection {
         case let .preset(preset):
             switch preset {
             case .comfort:
-                "Comfort"
+                localizer.string("preset.comfort")
             case .alwaysOn:
-                "Always On"
+                localizer.string("preset.alwaysOn")
             case .energySaver:
-                "Energy Saver"
+                localizer.string("preset.energySaver")
             }
         case .custom:
-            "Custom"
+            localizer.string("preset.custom")
         }
     }
 
     private var intensityDescription: String {
-        snapshot.preferences.intensity.formatted(
+        model.snapshot.preferences.intensity.formatted(
             .percent.precision(.fractionLength(0))
         )
     }
 
     private var exclusionsDescription: String {
-        let count = snapshot.preferences.excludedKeyboardDevices.count
-        return count == 0 ? "None" : "\(count) device\(count == 1 ? "" : "s")"
+        let count = model.snapshot.preferences.excludedKeyboardDevices.count
+        return count == 0
+            ? localizer.string("value.none")
+            : localizer.string("value.devices", arguments: count)
+    }
+
+    private var inputMonitoringDescription: String {
+        switch model.snapshot.inputMonitoringStatus {
+        case .notDetermined:
+            localizer.string("permission.notDetermined")
+        case .denied:
+            localizer.string("permission.notGranted")
+        case .granted:
+            localizer.string("permission.granted")
+        }
+    }
+
+    private var keyboardInputListenerDescription: String {
+        guard model.snapshot.inputMonitoringStatus == .granted else {
+            return localizer.string("listener.notStarted")
+        }
+        return model.snapshot.keyboardInputMonitoringActive
+            ? localizer.string("status.active")
+            : localizer.string("value.unavailable")
+    }
+
+    private var keyboardBacklightDescription: String {
+        switch model.snapshot.keyboardBacklightStatus {
+        case .available:
+            localizer.string("value.available")
+        case .unavailable:
+            localizer.string("value.unavailable")
+        }
     }
 }
