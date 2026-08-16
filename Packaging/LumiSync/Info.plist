@@ -10,6 +10,8 @@
     <string>LumiSync</string>
     <key>CFBundleIdentifier</key>
     <string>com.dee0503.LumiSync</string>
+    <key>CFBundleIconFile</key>
+    <string>LumiSync.icns</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
