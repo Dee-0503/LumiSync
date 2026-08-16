@@ -11,7 +11,10 @@ let package = Package(
         .library(name: "LumiSyncKeyboardProbe", targets: ["LumiSyncKeyboardProbe"]),
         .executable(name: "lumisync", targets: ["LumiSyncCLI"]),
         .executable(name: "LumiSyncApp", targets: ["LumiSyncApp"]),
-        .executable(name: "lumisync-keyboard-probe", targets: ["LumiSyncKeyboardProbeCLI"])
+        .executable(name: "lumisync-keyboard-probe", targets: ["LumiSyncKeyboardProbeCLI"]),
+        .executable(name: "lumisync-backlight-writer", targets: ["LumiSyncBacklightWriterCLI"]),
+        .executable(name: "lumisync-backlight-supervisor", targets: ["LumiSyncBacklightSupervisorCLI"]),
+        .executable(name: "lumisync-backlight-controller", targets: ["LumiSyncBacklightControllerCLI"])
     ],
     targets: [
         .target(name: "LumiSyncCore"),
@@ -33,6 +36,9 @@ let package = Package(
             exclude: ["README.md"]
         ),
         .executableTarget(name: "LumiSyncKeyboardProbeCLI", dependencies: ["LumiSyncKeyboardProbe"]),
+        .executableTarget(name: "LumiSyncBacklightWriterCLI", dependencies: ["LumiSyncKeyboardProbe"]),
+        .executableTarget(name: "LumiSyncBacklightSupervisorCLI", dependencies: ["LumiSyncKeyboardProbe"]),
+        .executableTarget(name: "LumiSyncBacklightControllerCLI", dependencies: ["LumiSyncKeyboardProbe"]),
         .testTarget(name: "LumiSyncCoreTests", dependencies: ["LumiSyncCore"]),
         .testTarget(
             name: "LumiSyncAppSupportTests",
