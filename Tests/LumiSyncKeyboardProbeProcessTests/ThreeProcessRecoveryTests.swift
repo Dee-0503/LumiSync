@@ -4,6 +4,37 @@ import XCTest
 @testable import LumiSyncKeyboardProbe
 
 final class LumiSyncKeyboardProbeProcessTests: XCTestCase {
+    func testSetRequestTraversesControllerSupervisorWriterAndReturnsReadback() async throws {
+        let harness = try ProcessHarness(initialValue: 0.37)
+        let request = try harness.makeRequest(
+            requestID: "normal-set",
+            operation: .set(try NormalizedBacklightValue(0.5))
+        )
+
+        let result = await harness.run(
+            input: try FramedJSONCodec().encode(request),
+            timeout: .seconds(2)
+        )
+
+        XCTAssertEqual(result.termination, .exited)
+        XCTAssertEqual(
+            try FramedJSONCodec().decode(BacklightOperationResult.self, from: result.stdout),
+            .success(readback: try NormalizedBacklightValue(0.5))
+        )
+        let journalEntries = try harness.journalEntries()
+        XCTAssertEqual(try harness.currentValue(), try NormalizedBacklightValue(0.37))
+        XCTAssertEqual(
+            journalEntries.map { "\($0.processRole.rawValue):\($0.operationCategory.rawValue):\($0.value.rawValue)" },
+            [
+                "writer:read:0.37",
+                "writer:set:0.5",
+                "writer:read:0.5",
+                "writer:restore:0.37",
+                "writer:read:0.37"
+            ]
+        )
+    }
+
     func testMalformedInputIsRejectedWithoutMutation() async throws {
         let harness = try ProcessHarness()
         let result = await harness.run(input: Data(), timeout: .seconds(2))
@@ -28,7 +59,7 @@ private final class ProcessHarness {
     private let supervisorURL: URL
     private let writerURL: URL
 
-    init() throws {
+    init(initialValue: Double = 0.37) throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("LumiSyncProcessTest-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
@@ -38,7 +69,7 @@ private final class ProcessHarness {
         writerURL = try Self.executable(named: "lumisync-backlight-writer")
         try FileBackedFakeBacklightDevice.create(
             directory: directory,
-            configuration: FakeBacklightDeviceConfiguration(initialValue: try NormalizedBacklightValue(0.37))
+            configuration: FakeBacklightDeviceConfiguration(initialValue: try NormalizedBacklightValue(initialValue))
         )
     }
 
@@ -66,6 +97,18 @@ private final class ProcessHarness {
         try FileBackedFakeBacklightDevice(directory: directory).read(
             requestID: try BacklightRequestID(rawValue: "harness-read")
         )
+    }
+
+    func makeRequest(requestID: String, operation: BacklightOperation) throws -> BacklightRequest {
+        BacklightRequest(
+            requestID: try BacklightRequestID(rawValue: requestID),
+            operation: operation,
+            deadline: try BacklightDeadline(remainingNanoseconds: 2_000_000_000)
+        )
+    }
+
+    func journalEntries() throws -> [FakeBacklightJournalEntry] {
+        try FileBackedFakeBacklightDevice(directory: directory).journalEntries()
     }
 
     private static func executable(named name: String) throws -> URL {
