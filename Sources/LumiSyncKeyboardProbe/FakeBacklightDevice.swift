@@ -153,6 +153,11 @@ public final class FileBackedFakeBacklightDevice {
         operationCategory: FakeBacklightOperationCategory
     ) throws {
         try withLock {
+            try validateJournalAppendLocked(
+                requestID: requestID,
+                category: operationCategory,
+                value: value
+            )
             try atomicReplace(JSONEncoder().encode(value), at: stateURL)
             try appendJournalLocked(
                 requestID: requestID,
@@ -204,6 +209,44 @@ public final class FileBackedFakeBacklightDevice {
             throw FakeBacklightDeviceError.invalidState
         }
         return validated
+    }
+
+    private func validateJournalAppendLocked(
+        requestID: BacklightRequestID,
+        category: FakeBacklightOperationCategory,
+        value: NormalizedBacklightValue
+    ) throws {
+        let existing = try readBoundedFile(
+            journalURL,
+            maximumBytes: Self.maximumJournalBytes
+        )
+        let lastSequence: UInt64
+        if let lastLine = existing.split(separator: 0x0A).last {
+            lastSequence = try JSONDecoder()
+                .decode(FakeBacklightJournalEntry.self, from: Data(lastLine))
+                .sequenceNumber
+        } else {
+            lastSequence = 0
+        }
+        guard lastSequence < UInt64.max else {
+            throw FakeBacklightDeviceError.journalFull
+        }
+        let entry = FakeBacklightJournalEntry(
+            sequenceNumber: lastSequence + 1,
+            requestID: requestID,
+            processRole: processRole,
+            operationCategory: category,
+            value: value,
+            processID: getpid()
+        )
+        var record = try JSONEncoder().encode(entry)
+        record.append(0x0A)
+        guard record.count <= Self.maximumJournalRecordBytes else {
+            throw FakeBacklightDeviceError.oversizedJournalRecord
+        }
+        guard existing.count <= Self.maximumJournalBytes - record.count else {
+            throw FakeBacklightDeviceError.journalFull
+        }
     }
 
     private func appendJournalLocked(

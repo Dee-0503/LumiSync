@@ -3,7 +3,7 @@ import XCTest
 
 final class QualificationTests: XCTestCase {
     func testQualificationRequiresExactOSBuildAndSelectorSignatures() {
-        let saved = fixture(build: "24G90", setterEncoding: "B@:fQ")
+        let saved = fixture(build: "24G90")
 
         XCTAssertEqual(
             BacklightQualificationPolicy().evaluate(saved: saved, current: saved),
@@ -12,16 +12,25 @@ final class QualificationTests: XCTestCase {
         XCTAssertNotEqual(
             BacklightQualificationPolicy().evaluate(
                 saved: saved,
-                current: fixture(build: "24G91", setterEncoding: "B@:fQ")
+                current: fixture(build: "24G91")
             ),
             .qualified(saved)
         )
         XCTAssertNotEqual(
             BacklightQualificationPolicy().evaluate(
                 saved: saved,
-                current: fixture(build: "24G90", setterEncoding: "v@:fQ")
+                current: fixture(setterEncoding: "v@:fQ")
             ),
             .qualified(saved)
+        )
+    }
+
+    func testQualificationRejectsIncompleteSavedIdentityBeforeComparingCurrent() {
+        let saved = fixture(selectorSignatures: [])
+
+        XCTAssertEqual(
+            BacklightQualificationPolicy().evaluate(saved: saved, current: fixture()),
+            .unqualified(reason: "Saved CoreBrightness identity is incomplete.")
         )
     }
 
@@ -34,8 +43,7 @@ final class QualificationTests: XCTestCase {
             fixture(build: ""),
             fixture(frameworkPresent: false),
             fixture(classPresent: false),
-            fixture(selectorName: ""),
-            fixture(setterEncoding: "")
+            fixture(selectorSignatures: [])
         ]
 
         for current in invalidIdentities {
@@ -45,6 +53,32 @@ final class QualificationTests: XCTestCase {
             ) else {
                 return XCTFail("expected unqualified identity: \(current)")
             }
+        }
+    }
+
+    func testQualificationRejectsMissingRequiredSelectorOrUnsupportedABI() {
+        let saved = fixture()
+        let required = saved.selectorSignatures
+        let missingSelector = fixture(selectorSignatures: Array(required.dropLast()))
+        let wrongABI = fixture(
+            selectorSignatures: Array(required.dropLast()) + [
+                ObjectiveCSelectorSignature(
+                    name: "setBrightness:forKeyboard:",
+                    typeEncoding: "v@:fQ"
+                )
+            ]
+        )
+        let unexpectedSelector = fixture(
+            selectorSignatures: required + [
+                ObjectiveCSelectorSignature(name: "unexpected:", typeEncoding: "v@:@")
+            ]
+        )
+
+        for current in [missingSelector, wrongABI, unexpectedSelector] {
+            XCTAssertEqual(
+                BacklightQualificationPolicy().evaluate(saved: saved, current: current),
+                .unqualified(reason: "Current CoreBrightness selector set or ABI is unsupported.")
+            )
         }
     }
 
@@ -85,8 +119,8 @@ private extension QualificationTests {
         build: String = "24G90",
         frameworkPresent: Bool = true,
         classPresent: Bool = true,
-        selectorName: String = "setBrightness:forKeyboard:",
-        setterEncoding: String = "B@:fQ"
+        setterEncoding: String = "B@:fQ",
+        selectorSignatures: [ObjectiveCSelectorSignature]? = nil
     ) -> BacklightQualificationIdentity {
         BacklightQualificationIdentity(
             modelIdentifier: modelIdentifier,
@@ -95,11 +129,11 @@ private extension QualificationTests {
             macOSBuild: build,
             frameworkPresent: frameworkPresent,
             classPresent: classPresent,
-            selectorSignatures: [
-                ObjectiveCSelectorSignature(
-                    name: selectorName,
-                    typeEncoding: setterEncoding
-                )
+            selectorSignatures: selectorSignatures ?? [
+                ObjectiveCSelectorSignature(name: "copyKeyboardBacklightIDs", typeEncoding: "@@:"),
+                ObjectiveCSelectorSignature(name: "isKeyboardBuiltIn:", typeEncoding: "B@:Q"),
+                ObjectiveCSelectorSignature(name: "brightnessForKeyboard:", typeEncoding: "f@:Q"),
+                ObjectiveCSelectorSignature(name: "setBrightness:forKeyboard:", typeEncoding: setterEncoding)
             ]
         )
     }

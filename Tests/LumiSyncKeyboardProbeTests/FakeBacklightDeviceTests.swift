@@ -33,6 +33,43 @@ final class FakeBacklightDeviceTests: XCTestCase {
         XCTAssertTrue(entries.allSatisfy { $0.processID == getpid() })
     }
 
+    func testWriteLeavesStateAndJournalUnchangedWhenJournalAppendFails() throws {
+        let directory = try makeTemporaryFakeDevice(initial: 0.37)
+        let requestID = try BacklightRequestID(rawValue: "journal-full")
+        let existingEntry = FakeBacklightJournalEntry(
+            sequenceNumber: 1,
+            requestID: requestID,
+            processRole: .test,
+            operationCategory: .read,
+            value: try NormalizedBacklightValue(0.37),
+            processID: getpid()
+        )
+        var existingRecord = try JSONEncoder().encode(existingEntry)
+        existingRecord.append(0x0A)
+        var existingJournal = Data(
+            repeating: 0x20,
+            count: FileBackedFakeBacklightDevice.maximumJournalBytes - existingRecord.count
+        )
+        existingJournal[existingJournal.index(before: existingJournal.endIndex)] = 0x0A
+        existingJournal.append(existingRecord)
+        let journalURL = directory.appendingPathComponent("journal.jsonl")
+        try existingJournal.write(to: journalURL)
+
+        let stateURL = directory.appendingPathComponent("state.json")
+        let originalState = try Data(contentsOf: stateURL)
+        let originalJournal = try Data(contentsOf: journalURL)
+
+        XCTAssertThrowsError(
+            try FileBackedFakeBacklightDevice(directory: directory).write(
+                try NormalizedBacklightValue(0.5),
+                requestID: requestID
+            )
+        )
+
+        XCTAssertEqual(try Data(contentsOf: stateURL), originalState)
+        XCTAssertEqual(try Data(contentsOf: journalURL), originalJournal)
+    }
+
     func testFaultActionsAreConsumedInOrder() throws {
         let directory = try makeTemporaryFakeDevice(
             initial: 0.37,
@@ -49,6 +86,25 @@ final class FakeBacklightDeviceTests: XCTestCase {
             .returnValue(try NormalizedBacklightValue(0.25))
         )
         XCTAssertNil(try device.consumeFault())
+    }
+
+    func testConsumeFaultLeavesFaultsUnchangedWhenReplacementFails() throws {
+        let directory = try makeTemporaryFakeDevice(
+            initial: 0.37,
+            faults: [.sleepNanoseconds(1)]
+        )
+        let faultsURL = directory.appendingPathComponent("faults.json")
+        let originalFaults = try Data(contentsOf: faultsURL)
+        let temporary = directory.appendingPathComponent(".faults.json.tmp")
+        try FileManager.default.createSymbolicLink(
+            at: temporary,
+            withDestinationURL: directory.appendingPathComponent("target.json")
+        )
+
+        XCTAssertThrowsError(
+            try FileBackedFakeBacklightDevice(directory: directory).consumeFault()
+        )
+        XCTAssertEqual(try Data(contentsOf: faultsURL), originalFaults)
     }
 
     func testConfigurationRoundTripsEveryFaultAction() throws {

@@ -42,12 +42,22 @@ public enum BacklightQualificationState: Codable, Equatable, Sendable {
 }
 
 public struct BacklightQualificationPolicy: Sendable {
+    private static let requiredSelectorSignatures = [
+        ObjectiveCSelectorSignature(name: "copyKeyboardBacklightIDs", typeEncoding: "@@:"),
+        ObjectiveCSelectorSignature(name: "isKeyboardBuiltIn:", typeEncoding: "B@:Q"),
+        ObjectiveCSelectorSignature(name: "brightnessForKeyboard:", typeEncoding: "f@:Q"),
+        ObjectiveCSelectorSignature(name: "setBrightness:forKeyboard:", typeEncoding: "B@:fQ")
+    ]
+
     public init() {}
 
     public func evaluate(
         saved: BacklightQualificationIdentity,
         current: BacklightQualificationIdentity
     ) -> BacklightQualificationState {
+        guard isComplete(saved) else {
+            return .unqualified(reason: "Saved CoreBrightness identity is incomplete.")
+        }
         guard let invalidReason = invalidReason(for: current) else {
             guard saved == current else {
                 return .unqualified(reason: "Current CoreBrightness identity does not exactly match the saved qualification.")
@@ -58,33 +68,23 @@ public struct BacklightQualificationPolicy: Sendable {
     }
 
     private func invalidReason(for identity: BacklightQualificationIdentity) -> String? {
-        guard !identity.modelIdentifier.isEmpty else {
-            return "Model identifier is empty."
-        }
-        guard identity.architecture == "arm64" else {
-            return "Architecture is not arm64."
-        }
-        guard !identity.macOSVersion.isEmpty else {
-            return "macOS version is empty."
-        }
-        guard !identity.macOSBuild.isEmpty else {
-            return "macOS build is empty."
-        }
-        guard identity.frameworkPresent else {
-            return "CoreBrightness framework is unavailable."
-        }
-        guard identity.classPresent else {
-            return "KeyboardBrightnessClient class is unavailable."
-        }
-        guard !identity.selectorSignatures.isEmpty else {
-            return "CoreBrightness selector signatures are empty."
-        }
-        guard identity.selectorSignatures.allSatisfy({
-            !$0.name.isEmpty && !$0.typeEncoding.isEmpty
-        }) else {
-            return "CoreBrightness selector signature is incomplete."
+        guard isComplete(identity) else {
+            return "Current CoreBrightness selector set or ABI is unsupported."
         }
         return nil
+    }
+
+    private func isComplete(_ identity: BacklightQualificationIdentity) -> Bool {
+        guard !identity.modelIdentifier.isEmpty,
+              identity.architecture == "arm64",
+              !identity.macOSVersion.isEmpty,
+              !identity.macOSBuild.isEmpty,
+              identity.frameworkPresent,
+              identity.classPresent
+        else {
+            return false
+        }
+        return identity.selectorSignatures == Self.requiredSelectorSignatures
     }
 }
 
