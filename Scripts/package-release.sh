@@ -4,17 +4,30 @@ set -euo pipefail
 
 readonly APP_NAME="LumiSync"
 readonly VERSION="${VERSION:-0.1.0}"
-readonly APP_PATH="${APP_PATH:-build/Release/LumiSync.app}"
+readonly APP_PATH="${APP_PATH:-build/unsigned-release/LumiSync.app}"
 readonly RELEASE_DIR="${RELEASE_DIR:-release}"
 readonly XCODE_PATH="${XCODE_PATH:-/Applications/Xcode.app}"
 readonly SIGNING_IDENTITY="${SIGNING_IDENTITY:-}"
 readonly NOTARYTOOL_PROFILE="${NOTARYTOOL_PROFILE:-}"
+readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly MANIFEST="$REPO_ROOT/Packaging/LumiSync/NestedCode.json"
+readonly VERIFIER="$REPO_ROOT/Scripts/verify-release-bundle.py"
 
 failures=()
 
 fail() {
   failures+=("$1")
 }
+
+if [[ ! -d "$APP_PATH" ]]; then
+  fail "Verified unsigned release app artifact is required at $APP_PATH (override with APP_PATH)."
+elif ! python3 "$VERIFIER" \
+  --app "$APP_PATH" \
+  --manifest "$MANIFEST" \
+  --version "$VERSION" \
+  --build-number "${BUILD_NUMBER:-1}"; then
+  fail "APP_PATH failed unsigned release bundle verification."
+fi
 
 if [[ ! -d "$XCODE_PATH" ]]; then
   fail "Xcode is required at $XCODE_PATH (override with XCODE_PATH)."
