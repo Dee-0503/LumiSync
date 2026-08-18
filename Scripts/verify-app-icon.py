@@ -13,7 +13,18 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-REQUIRED_ICNS_SIZES = {16, 32, 64, 128, 256, 512, 1024}
+REQUIRED_ICNS_REPRESENTATIONS = {
+    "icon_16x16.png": 16,
+    "icon_16x16@2x.png": 32,
+    "icon_32x32.png": 32,
+    "icon_32x32@2x.png": 64,
+    "icon_128x128.png": 128,
+    "icon_128x128@2x.png": 256,
+    "icon_256x256.png": 256,
+    "icon_256x256@2x.png": 512,
+    "icon_512x512.png": 512,
+    "icon_512x512@2x.png": 1024,
+}
 OUTER_CORNER_SAMPLE = 64
 
 
@@ -204,22 +215,32 @@ def verify_icns(path: Path) -> None:
                 diagnostic = result.stderr.strip() or result.stdout.strip() or "unknown iconutil error"
                 raise VerificationError(f"{path}: iconutil extraction failed: {diagnostic}")
 
-            sizes = set()
-            for representation in iconset.glob("*.png"):
+            representations = {
+                representation.name: representation for representation in iconset.glob("*.png")
+            }
+            missing = sorted(set(REQUIRED_ICNS_REPRESENTATIONS) - set(representations))
+            if missing:
+                raise VerificationError(
+                    f"{path}: missing ICNS representation files: {', '.join(missing)}"
+                )
+
+            unexpected = sorted(set(representations) - set(REQUIRED_ICNS_REPRESENTATIONS))
+            if unexpected:
+                raise VerificationError(
+                    f"{path}: unexpected ICNS representation files: {', '.join(unexpected)}"
+                )
+            for name, representation in sorted(representations.items()):
                 width, height, _ = parse_png(representation, decode_pixels=False)
                 if width != height:
+                    raise VerificationError(f"{path}: ICNS representation {name} is not square")
+                expected_size = REQUIRED_ICNS_REPRESENTATIONS[name]
+                if width != expected_size:
                     raise VerificationError(
-                        f"{path}: ICNS representation {representation.name} is not square"
+                        f"{path}: ICNS representation {name} must be "
+                        f"{expected_size}x{expected_size}, got {width}x{height}"
                     )
-                sizes.add(width)
     except OSError as error:
         raise VerificationError(f"cannot verify ICNS {path}: {error}") from error
-
-    missing = sorted(REQUIRED_ICNS_SIZES - sizes)
-    if missing:
-        raise VerificationError(
-            f"{path}: missing ICNS representation sizes: {', '.join(map(str, missing))}"
-        )
 
 
 def parse_arguments() -> argparse.Namespace:

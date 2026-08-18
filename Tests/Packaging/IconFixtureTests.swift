@@ -2,8 +2,34 @@ import Foundation
 import XCTest
 
 final class IconFixtureTests: XCTestCase {
+    func testVerifierRejectsICNSWithMissingRepresentation() throws {
+        let master = try makeRGBAFixture(width: 1024, height: 1024, transparentCorners: true)
+        defer { try? FileManager.default.removeItem(at: master) }
+        let fixture = try makeICNSFixtureWithout512Representation()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let result = try runVerifier(master: master, icns: fixture.icns)
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(
+            result.stderr.contains("missing ICNS representation files: icon_512x512.png"),
+            "Expected missing-representation diagnostic, got: \(result.stderr)"
+        )
+    }
+
+    func testVerifierRejectsProductionMasterPNGDirectly() throws {
+        let result = try runVerifier(master: repositoryMaster, icns: repositoryICNS)
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(
+            result.stderr.contains("master PNG must be 1024x1024") ||
+                result.stderr.contains("master PNG must be 8-bit RGBA"),
+            "Expected production-master diagnostic, got: \(result.stderr)"
+        )
+    }
+
     func testVerifierRejectsOpaqueSquareCanvas() throws {
-        let fixture = try makeOpaqueRGBAFixture(width: 1024, height: 1024)
+        let fixture = try makeRGBAFixture(width: 1024, height: 1024, transparentCorners: false)
         defer { try? FileManager.default.removeItem(at: fixture) }
 
         let result = try runVerifier(master: fixture, icns: repositoryICNS)
@@ -15,20 +41,15 @@ final class IconFixtureTests: XCTestCase {
         )
     }
 
-    func testVerifierAcceptsTransparentCornersAndCompleteICNSRepresentations() throws {
-        let fixture = try makeTransparentRGBAFixture(width: 1024, height: 1024)
-        defer { try? FileManager.default.removeItem(at: fixture) }
-
-        let result = try runVerifier(master: fixture, icns: repositoryICNS)
-
-        XCTAssertEqual(result.status, 0, result.stderr)
-    }
-
     private var repositoryRoot: URL {
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
+    }
+
+    private var repositoryMaster: URL {
+        repositoryRoot.appendingPathComponent("design/lumisync-app-icon.png")
     }
 
     private var repositoryICNS: URL {
@@ -53,12 +74,38 @@ final class IconFixtureTests: XCTestCase {
         return (process.terminationStatus, String(decoding: data, as: UTF8.self))
     }
 
-    private func makeTransparentRGBAFixture(width: Int, height: Int) throws -> URL {
-        try makeRGBAFixture(width: width, height: height, transparentCorners: true)
-    }
+    private func makeICNSFixtureWithout512Representation() throws -> (root: URL, icns: URL) {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LumiSyncIconFixture-\(UUID().uuidString)", isDirectory: true)
+        let iconset = root.appendingPathComponent("LumiSync.iconset", isDirectory: true)
+        let sourceIconset = root.appendingPathComponent("Source.iconset", isDirectory: true)
+        let icns = root.appendingPathComponent("Missing512.icns")
+        try FileManager.default.createDirectory(at: iconset, withIntermediateDirectories: true)
 
-    private func makeOpaqueRGBAFixture(width: Int, height: Int) throws -> URL {
-        try makeRGBAFixture(width: width, height: height, transparentCorners: false)
+        let extraction = Process()
+        extraction.executableURL = URL(fileURLWithPath: "/usr/bin/iconutil")
+        extraction.arguments = ["-c", "iconset", "-o", sourceIconset.path, repositoryICNS.path]
+        try extraction.run()
+        extraction.waitUntilExit()
+        XCTAssertEqual(extraction.terminationStatus, 0)
+
+        for source in try FileManager.default.contentsOfDirectory(
+            at: sourceIconset,
+            includingPropertiesForKeys: nil
+        ) where source.lastPathComponent != "icon_512x512.png" {
+            try FileManager.default.copyItem(
+                at: source,
+                to: iconset.appendingPathComponent(source.lastPathComponent)
+            )
+        }
+
+        let packaging = Process()
+        packaging.executableURL = URL(fileURLWithPath: "/usr/bin/iconutil")
+        packaging.arguments = ["-c", "icns", "-o", icns.path, iconset.path]
+        try packaging.run()
+        packaging.waitUntilExit()
+        XCTAssertEqual(packaging.terminationStatus, 0)
+        return (root, icns)
     }
 
     private func makeRGBAFixture(width: Int, height: Int, transparentCorners: Bool) throws -> URL {
