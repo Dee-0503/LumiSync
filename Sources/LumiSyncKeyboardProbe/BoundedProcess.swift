@@ -13,17 +13,20 @@ public struct OwnedProcessRequest: Sendable {
     public let arguments: [String]
     public let standardInput: Data
     public let timeout: Duration
+    public let environment: [String: String]?
 
     public init(
         executableURL: URL,
         arguments: [String] = [],
         standardInput: Data = Data(),
-        timeout: Duration
+        timeout: Duration,
+        environment: [String: String]? = nil
     ) {
         self.executableURL = executableURL
         self.arguments = arguments
         self.standardInput = standardInput
         self.timeout = timeout
+        self.environment = environment
     }
 }
 
@@ -226,17 +229,35 @@ private final class SpawnedProcess: @unchecked Sendable {
             for pointer in argv where pointer != nil { free(pointer) }
         }
 
+        let environmentStrings: [String]
+        if let environment = request.environment {
+            var merged = ProcessInfo.processInfo.environment
+            for (key, value) in environment {
+                merged[key] = value
+            }
+            environmentStrings = merged.map { "\($0.key)=\($0.value)" }
+        } else {
+            environmentStrings = []
+        }
+        var environmentPointers = environmentStrings.map { strdup($0) }
+        environmentPointers.append(nil)
+        defer {
+            for pointer in environmentPointers where pointer != nil { free(pointer) }
+        }
+
         var spawnedPID: pid_t = 0
         let result = executable.withCString { executableCString in
             argv.withUnsafeMutableBufferPointer { argumentBuffer in
-                posix_spawn(
-                    &spawnedPID,
-                    executableCString,
-                    &actions,
-                    &attributes,
-                    argumentBuffer.baseAddress,
-                    environ
-                )
+                environmentPointers.withUnsafeMutableBufferPointer { environmentBuffer in
+                    posix_spawn(
+                        &spawnedPID,
+                        executableCString,
+                        &actions,
+                        &attributes,
+                        argumentBuffer.baseAddress,
+                        request.environment == nil ? environ : environmentBuffer.baseAddress
+                    )
+                }
             }
         }
         guard result == 0 else {

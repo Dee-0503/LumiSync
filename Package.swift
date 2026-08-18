@@ -46,6 +46,10 @@ let package = Package(
         ),
         .testTarget(name: "LumiSyncKeyboardProbeTests", dependencies: ["LumiSyncKeyboardProbe"]),
         .testTarget(
+            name: "LumiSyncKeyboardProbeProcessTests",
+            dependencies: ["LumiSyncKeyboardProbe"]
+        ),
+        .testTarget(
             name: "LumiSyncPackagingTests",
             dependencies: [],
             path: "Tests/Packaging"
