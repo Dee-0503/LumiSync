@@ -126,6 +126,59 @@ final class ReleaseBundleFixtureTests: XCTestCase {
         )
     }
 
+    func testRejectsUnexpectedNestedExecutableAndSymlink() throws {
+        let fixture = try makeValidFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let nested = fixture.app.appendingPathComponent("Contents/Helpers/Nested", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        let nestedExecutable = nested.appendingPathComponent("nested-helper")
+        try writeExecutable(at: nestedExecutable)
+        let nestedSymlink = nested.appendingPathComponent("nested-link")
+        try FileManager.default.createSymbolicLink(
+            at: nestedSymlink,
+            withDestinationURL: fixture.app.appendingPathComponent("Contents/Helpers/lumisync-backlight-controller")
+        )
+
+        let result = try runVerifier(app: fixture.app, manifest: fixture.manifest)
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.contains("unexpected executable: Contents/Helpers/Nested/nested-helper"), result.output)
+        XCTAssertTrue(result.output.contains("unexpected symlink in code path: Contents/Helpers/Nested/nested-link"), result.output)
+    }
+
+    func testRejectsMalformedRealMachOWhenOtoolFails() throws {
+        let fixture = try makeValidFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let executable = fixture.app.appendingPathComponent("Contents/MacOS/LumiSync")
+        let source = try Data(contentsOf: URL(fileURLWithPath: "/usr/bin/true"))
+        try source.prefix(128).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+
+        let result = try runVerifier(app: fixture.app, manifest: fixture.manifest)
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.contains("otool failed for Contents/MacOS/LumiSync"), result.output)
+    }
+
+    func testRejectsArm64eMachOArchitecture() throws {
+        let fixture = try makeValidFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let executable = fixture.app.appendingPathComponent("Contents/MacOS/LumiSync")
+        try runTool(
+            "/usr/bin/lipo",
+            arguments: ["-thin", "arm64e", "/usr/bin/true", "-output", executable.path]
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+
+        let result = try runVerifier(app: fixture.app, manifest: fixture.manifest)
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.contains("Mach-O architecture must be arm64: Contents/MacOS/LumiSync"), result.output)
+    }
+
     private var manifestScenarios: [(name: String, manifest: String, expectedError: String)] {
         [
             (
@@ -253,6 +306,15 @@ final class ReleaseBundleFixtureTests: XCTestCase {
         process.waitUntilExit()
         let data = output.fileHandleForReading.readDataToEndOfFile()
         return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+    }
+
+    private func runTool(_ executablePath: String, arguments: [String]) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executablePath)
+        process.arguments = arguments
+        try process.run()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0, "\(executablePath) failed")
     }
 
     private var repositoryRoot: URL {

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import plistlib
+import re
 import stat
 import subprocess
 import sys
@@ -65,9 +66,20 @@ def load_manifest(path: Path) -> list[dict[str, str]]:
     return parsed
 
 
-def command_output(arguments: list[str]) -> str:
-    result = subprocess.run(arguments, capture_output=True, text=True, check=False)
-    return f"{result.stdout}\n{result.stderr}".strip()
+def command_output(arguments: list[str]) -> tuple[int, str]:
+    try:
+        result = subprocess.run(arguments, capture_output=True, text=True, check=False)
+    except OSError as error:
+        return 127, str(error)
+    output = f"{result.stdout}\n{result.stderr}".strip()
+    return result.returncode, output
+
+
+def command_output_required(arguments: list[str], label: str) -> str:
+    status, output = command_output(arguments)
+    if status != 0:
+        raise ValueError(f"{label} failed (exit {status}): {output}")
+    return output
 
 
 def mock_metadata(path: Path) -> tuple[str | None, list[str]] | None:
@@ -91,19 +103,22 @@ def mock_metadata(path: Path) -> tuple[str | None, list[str]] | None:
     return architecture, dependencies
 
 
-def macho_metadata(path: Path, allow_mock: bool) -> tuple[str | None, list[str]]:
+def macho_metadata(path: Path, allow_mock: bool, display_path: str) -> tuple[str | None, list[str]]:
     if allow_mock:
         mocked = mock_metadata(path)
         if mocked is not None:
             return mocked
 
-    file_description = command_output(["/usr/bin/file", str(path)])
+    file_description = command_output_required(["/usr/bin/file", str(path)], f"file failed for {display_path}")
     if "Mach-O" not in file_description:
         return None, []
-    architectures = "arm64" if "arm64" in file_description else file_description
+    architecture_matches = re.findall(r"\b(arm64e|arm64|x86_64)\b", file_description)
+    architectures = ",".join(dict.fromkeys(architecture_matches))
+    if not architectures:
+        architectures = file_description
     dependencies = [
-        command_output(["/usr/bin/otool", "-L", str(path)]),
-        command_output(["/usr/bin/otool", "-l", str(path)]),
+        command_output_required(["/usr/bin/otool", "-L", str(path)], f"otool failed for {display_path}"),
+        command_output_required(["/usr/bin/otool", "-l", str(path)], f"otool failed for {display_path}"),
     ]
     return architectures, dependencies
 
@@ -137,7 +152,7 @@ def find_code_directory_errors(app: Path, expected: set[str]) -> list[str]:
         if not stat.S_ISDIR(root_mode):
             continue
 
-        for child in root.iterdir():
+        for child in root.rglob("*"):
             relative = child.relative_to(app).as_posix()
             try:
                 mode = child.lstat().st_mode
@@ -146,7 +161,9 @@ def find_code_directory_errors(app: Path, expected: set[str]) -> list[str]:
                 continue
             if mode & 0o022:
                 errors.append(f"group/world-writable code path: {relative}")
-            if relative not in expected:
+            if stat.S_ISLNK(mode):
+                errors.append(f"unexpected symlink in code path: {relative}")
+            elif stat.S_ISREG(mode) and relative not in expected:
                 errors.append(f"unexpected executable: {relative}")
     return errors
 
@@ -233,7 +250,11 @@ def validate_bundle(
     repository_path = str(Path(__file__).resolve().parent.parent)
     forbidden = (*FORBIDDEN_STRINGS, repository_path)
     for relative, executable in existing_executables:
-        architecture, dependencies = macho_metadata(executable, allow_mock_macho)
+        try:
+            architecture, dependencies = macho_metadata(executable, allow_mock_macho, relative)
+        except ValueError as error:
+            errors.append(f"{error} ({relative})")
+            continue
         if architecture is None:
             errors.append(f"expected Mach-O executable: {relative}")
             continue
