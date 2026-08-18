@@ -2,6 +2,38 @@ import Foundation
 import XCTest
 
 final class ReleaseBundleFixtureTests: XCTestCase {
+    func testBuilderProducesVerifiedUnsignedBundle() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ReleaseBundleBuilder-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let buildDirectory = root.appendingPathComponent("build", isDirectory: true)
+        let app = buildDirectory.appendingPathComponent("unsigned-release/LumiSync.app", isDirectory: true)
+        let result = try runBuilder(
+            buildDirectory: buildDirectory,
+            version: "0.2.0-dev",
+            buildNumber: "2"
+        )
+
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: app.path), result.output)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: app.appendingPathComponent("Contents/MacOS/LumiSync").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: app.appendingPathComponent("Contents/Helpers/lumisync-backlight-controller").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: app.appendingPathComponent("Contents/Helpers/lumisync-backlight-supervisor").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: app.appendingPathComponent("Contents/Helpers/lumisync-backlight-writer").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: app.appendingPathComponent("Contents/_CodeSignature").path))
+
+        let verification = try runVerifier(
+            app: app,
+            manifest: repositoryRoot.appendingPathComponent("Packaging/LumiSync/NestedCode.json"),
+            allowMockMachO: false,
+            version: "0.2.0-dev",
+            buildNumber: "2"
+        )
+        XCTAssertEqual(verification.status, 0, verification.output)
+        XCTAssertTrue(verification.output.contains("Verified unsigned release bundle"), verification.output)
+    }
+
     func testAcceptsValidFixtureWithExplicitMockMachOMode() throws {
         let fixture = try makeValidFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -285,10 +317,37 @@ final class ReleaseBundleFixtureTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
     }
 
+    private func runBuilder(
+        buildDirectory: URL,
+        version: String,
+        buildNumber: String
+    ) throws -> (status: Int32, output: String) {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [
+            repositoryRoot.appendingPathComponent("Scripts/build-unsigned-release-app.sh").path
+        ]
+        process.environment = [
+            "BUILD_DIR": buildDirectory.path,
+            "VERSION": version,
+            "BUILD_NUMBER": buildNumber,
+            "CONFIGURATION": "release"
+        ]
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+    }
+
     private func runVerifier(
         app: URL,
         manifest: URL,
-        allowMockMachO: Bool = true
+        allowMockMachO: Bool = true,
+        version: String = "1.2.3",
+        buildNumber: String = "42"
     ) throws -> (status: Int32, output: String) {
         let process = Process()
         let output = Pipe()
@@ -297,8 +356,8 @@ final class ReleaseBundleFixtureTests: XCTestCase {
             repositoryRoot.appendingPathComponent("Scripts/verify-release-bundle.py").path,
             "--app", app.path,
             "--manifest", manifest.path,
-            "--version", "1.2.3",
-            "--build-number", "42"
+            "--version", version,
+            "--build-number", buildNumber
         ] + (allowMockMachO ? ["--allow-mock-macho"] : [])
         process.standardOutput = output
         process.standardError = output
