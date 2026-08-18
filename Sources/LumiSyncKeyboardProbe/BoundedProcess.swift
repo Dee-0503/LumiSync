@@ -276,6 +276,7 @@ private final class SpawnedProcess: @unchecked Sendable {
         output = FileHandle(fileDescriptor: outputPipe[0], closeOnDealloc: true)
         error = FileHandle(fileDescriptor: errorPipe[0], closeOnDealloc: true)
         try input.write(contentsOf: request.standardInput)
+        closeInput()
     }
 
     func closeInput() {

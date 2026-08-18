@@ -7,7 +7,11 @@ final class LumiSyncKeyboardProbeProcessTests: XCTestCase {
     func testMalformedInputIsRejectedWithoutMutation() async throws {
         let harness = try ProcessHarness()
         let result = await harness.run(input: Data(), timeout: .seconds(2))
-        XCTAssertNotEqual(result.termination, .exited)
+        XCTAssertEqual(result.termination, .exited)
+        XCTAssertEqual(
+            try FramedJSONCodec().decode(BacklightOperationResult.self, from: result.stdout),
+            .failure(primary: .protocolViolation, restoration: .notRequired)
+        )
         XCTAssertEqual(try harness.currentValue(), try NormalizedBacklightValue(0.37))
     }
 }
