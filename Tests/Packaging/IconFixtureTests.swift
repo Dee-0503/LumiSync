@@ -17,14 +17,25 @@ final class IconFixtureTests: XCTestCase {
         )
     }
 
-    func testVerifierRejectsProductionMasterPNGDirectly() throws {
+    func testProductionMasterPassesVerifier() throws {
         let result = try runVerifier(master: repositoryMaster, icns: repositoryICNS)
 
-        XCTAssertNotEqual(result.status, 0)
-        XCTAssertTrue(
-            result.stderr.contains("master PNG must be 1024x1024") ||
-                result.stderr.contains("master PNG must be 8-bit RGBA"),
-            "Expected production-master diagnostic, got: \(result.stderr)"
+        XCTAssertEqual(
+            result.status,
+            0,
+            "Expected production master to pass verification, got: \(result.stderr)"
+        )
+    }
+
+    func testGeneratedICNSPassesVerifier() throws {
+        let build = try runIconBuilder()
+        XCTAssertEqual(build.status, 0, "Expected icon generation to succeed, got: \(build.stderr)")
+
+        let result = try runVerifier(master: repositoryMaster, icns: repositoryICNS)
+        XCTAssertEqual(
+            result.status,
+            0,
+            "Expected generated ICNS to pass verification, got: \(result.stderr)"
         )
     }
 
@@ -54,6 +65,20 @@ final class IconFixtureTests: XCTestCase {
 
     private var repositoryICNS: URL {
         repositoryRoot.appendingPathComponent("Packaging/LumiSync/Resources/LumiSync.icns")
+    }
+
+    private func runIconBuilder() throws -> (status: Int32, stderr: String) {
+        let process = Process()
+        let stderr = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [repositoryRoot.appendingPathComponent("Scripts/build-app-icon.sh").path]
+        process.standardError = stderr
+
+        try process.run()
+        process.waitUntilExit()
+
+        let data = stderr.fileHandleForReading.readDataToEndOfFile()
+        return (process.terminationStatus, String(decoding: data, as: UTF8.self))
     }
 
     private func runVerifier(master: URL, icns: URL) throws -> (status: Int32, stderr: String) {
