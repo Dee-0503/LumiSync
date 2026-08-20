@@ -53,6 +53,34 @@ final class SafetyProtocolTests: XCTestCase {
         XCTAssertThrowsError(try JSONDecoder().decode(BacklightRequest.self, from: encoded))
     }
 
+    func testRequestDecoderRejectsInvalidNestedSafetyValues() throws {
+        let invalidObjects: [[String: Any]] = [
+            [
+                "version": BacklightRequest.currentVersion,
+                "requestID": ["rawValue": ""],
+                "operation": ["read": [:]],
+                "deadline": ["remainingNanoseconds": 2_000_000_000]
+            ],
+            [
+                "version": BacklightRequest.currentVersion,
+                "requestID": ["rawValue": "req-invalid-value"],
+                "operation": ["set": ["_0": ["rawValue": 2.0]]],
+                "deadline": ["remainingNanoseconds": 2_000_000_000]
+            ],
+            [
+                "version": BacklightRequest.currentVersion,
+                "requestID": ["rawValue": "req-invalid-deadline"],
+                "operation": ["read": [:]],
+                "deadline": ["remainingNanoseconds": 30_000_000_001]
+            ]
+        ]
+
+        for object in invalidObjects {
+            let encoded = try JSONSerialization.data(withJSONObject: object)
+            XCTAssertThrowsError(try JSONDecoder().decode(BacklightRequest.self, from: encoded))
+        }
+    }
+
     func testRestorationFailureAndUncertaintyOverridePrimaryFailure() {
         XCTAssertEqual(
             BacklightOperationResult.resolvedFailure(

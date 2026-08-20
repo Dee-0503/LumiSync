@@ -13,6 +13,15 @@ public struct NormalizedBacklightValue: Codable, Equatable, Sendable {
         }
         self.rawValue = rawValue
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case rawValue
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(container.decode(Double.self, forKey: .rawValue))
+    }
 }
 
 public struct BacklightRequestID: Codable, Hashable, Sendable {
@@ -24,6 +33,15 @@ public struct BacklightRequestID: Codable, Hashable, Sendable {
             throw BacklightSafetyValueError.invalidRequestID
         }
         self.rawValue = rawValue
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case rawValue
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(rawValue: container.decode(String.self, forKey: .rawValue))
     }
 }
 
@@ -39,6 +57,17 @@ public struct BacklightDeadline: Codable, Equatable, Sendable {
             throw BacklightSafetyValueError.invalidDeadline(remainingNanoseconds)
         }
         self.remainingNanoseconds = remainingNanoseconds
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case remainingNanoseconds
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            remainingNanoseconds: container.decode(UInt64.self, forKey: .remainingNanoseconds)
+        )
     }
 }
 
