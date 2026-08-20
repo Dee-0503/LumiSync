@@ -378,6 +378,35 @@ final class ReleaseBundleFixtureTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: app.appendingPathComponent(relocatedController).path))
     }
 
+    func testBuilderRejectsTraversalDestinationBeforeWritingOutsideStaging() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TraversalDestinationBuilder-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let escapedName = "escaped-\(UUID().uuidString)"
+        let traversalPath = "Contents/../../../../../../../../../../../../tmp/\(escapedName)"
+        let manifest = root.appendingPathComponent("NestedCode.json")
+        let entries = validEntries + [
+            ManifestEntry(path: traversalPath, product: "LumiSyncApp", role: "extra")
+        ]
+        try manifestJSON(entries: entries).write(to: manifest, atomically: true, encoding: .utf8)
+        let escaped = URL(fileURLWithPath: "/tmp").appendingPathComponent(escapedName)
+        try? FileManager.default.removeItem(at: escaped)
+        defer { try? FileManager.default.removeItem(at: escaped) }
+
+        let result = try runBuilder(
+            buildDirectory: root.appendingPathComponent("build", isDirectory: true),
+            version: "0.2.0-dev",
+            buildNumber: "2",
+            manifest: manifest
+        )
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.contains("executable path must not contain traversal"), result.output)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: escaped.path), result.output)
+    }
+
     private var manifestScenarios: [(name: String, manifest: String, expectedError: String)] {
         [
             (
