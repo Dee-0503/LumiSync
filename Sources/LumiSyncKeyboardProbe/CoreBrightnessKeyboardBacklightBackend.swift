@@ -27,9 +27,44 @@ public enum CoreBrightnessBackendError: Error, CustomStringConvertible {
     }
 }
 
+public protocol ObjectiveCMetadataProviding: AnyObject {
+    func frameworkIsPresent(at path: String) -> Bool
+    func classIsPresent(named name: String) -> Bool
+    func typeEncoding(classNamed name: String, selectorNamed selectorName: String) -> String?
+}
+
+private final class RuntimeObjectiveCMetadataProvider: ObjectiveCMetadataProviding {
+    func frameworkIsPresent(at path: String) -> Bool {
+        Bundle(path: path) != nil
+    }
+
+    func classIsPresent(named name: String) -> Bool {
+        NSClassFromString(name) != nil
+    }
+
+    func typeEncoding(classNamed name: String, selectorNamed selectorName: String) -> String? {
+        guard let clientClass = NSClassFromString(name),
+              let method = class_getInstanceMethod(
+                  clientClass,
+                  NSSelectorFromString(selectorName)
+              ),
+              let encoding = method_getTypeEncoding(method)
+        else {
+            return nil
+        }
+        return String(cString: encoding)
+    }
+}
+
 public final class CoreBrightnessKeyboardBacklightBackend: KeyboardBacklightBackend {
     private static let frameworkPath = "/System/Library/PrivateFrameworks/CoreBrightness.framework"
     private static let clientClassName = "KeyboardBrightnessClient"
+    private static let inspectedSelectorNames = [
+        "copyKeyboardBacklightIDs",
+        "isKeyboardBuiltIn:",
+        "brightnessForKeyboard:",
+        "setBrightness:forKeyboard:"
+    ]
 
     private let clientClass: AnyClass
     private let client: AnyObject
@@ -48,6 +83,31 @@ public final class CoreBrightnessKeyboardBacklightBackend: KeyboardBacklightBack
         try requireSelector("isKeyboardBuiltIn:")
         try requireSelector("brightnessForKeyboard:")
         try requireSelector("setBrightness:forKeyboard:")
+    }
+
+    public static func inspectSignatures() throws -> CoreBrightnessSignatureInspection {
+        try inspectSignatures(metadataProvider: RuntimeObjectiveCMetadataProvider())
+    }
+
+    public static func inspectSignatures(
+        metadataProvider: ObjectiveCMetadataProviding
+    ) throws -> CoreBrightnessSignatureInspection {
+        let frameworkPresent = metadataProvider.frameworkIsPresent(at: frameworkPath)
+        let classPresent = frameworkPresent
+            && metadataProvider.classIsPresent(named: clientClassName)
+        let signatures = classPresent ? inspectedSelectorNames.compactMap { selectorName in
+            metadataProvider.typeEncoding(
+                classNamed: clientClassName,
+                selectorNamed: selectorName
+            ).map {
+                ObjectiveCSelectorSignature(name: selectorName, typeEncoding: $0)
+            }
+        } : []
+        return CoreBrightnessSignatureInspection(
+            frameworkPresent: frameworkPresent,
+            classPresent: classPresent,
+            selectorSignatures: signatures
+        )
     }
 
     public func keyboardIDs() throws -> [UInt64] {

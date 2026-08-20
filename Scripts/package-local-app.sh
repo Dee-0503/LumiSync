@@ -6,52 +6,31 @@ readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 readonly BUILD_DIR="${BUILD_DIR:-$REPO_ROOT/build/local}"
 readonly APP_NAME="LumiSync"
-readonly PRODUCT_NAME="LumiSyncApp"
 readonly VERSION="${VERSION:-0.1.0-local}"
 readonly BUILD_NUMBER="${BUILD_NUMBER:-1}"
 readonly CONFIGURATION="${CONFIGURATION:-release}"
 readonly APP_PATH="$BUILD_DIR/$APP_NAME.app"
-readonly CONTENTS_PATH="$APP_PATH/Contents"
-readonly EXECUTABLE_PATH="$CONTENTS_PATH/MacOS/$APP_NAME"
+readonly D1_BUILD_DIR="$BUILD_DIR/d1"
+readonly D1_APP_PATH="$D1_BUILD_DIR/unsigned-release/$APP_NAME.app"
 readonly ARCHIVE_PATH="$BUILD_DIR/$APP_NAME-$VERSION.zip"
 readonly CASK_PATH="$BUILD_DIR/lumisync-local.rb"
-readonly INFO_PLIST_SOURCE="$REPO_ROOT/Packaging/LumiSync/Info.plist"
-readonly RESOURCES_SOURCE="$REPO_ROOT/Packaging/LumiSync/Resources"
 
 mkdir -p "$BUILD_DIR"
-rm -rf "$APP_PATH" "$ARCHIVE_PATH"
+rm -rf "$APP_PATH" "$ARCHIVE_PATH" "$D1_BUILD_DIR"
 
-swift build \
-  --package-path "$REPO_ROOT" \
-  --configuration "$CONFIGURATION" \
-  --product "$PRODUCT_NAME"
+env \
+  BUILD_DIR="$D1_BUILD_DIR" \
+  VERSION="$VERSION" \
+  BUILD_NUMBER="$BUILD_NUMBER" \
+  CONFIGURATION="$CONFIGURATION" \
+  bash "$SCRIPT_DIR/build-unsigned-release-app.sh"
 
-bin_path="$(swift build \
-  --package-path "$REPO_ROOT" \
-  --configuration "$CONFIGURATION" \
-  --show-bin-path)"
-product_path="$bin_path/$PRODUCT_NAME"
-resource_bundle_path="$bin_path/LumiSync_LumiSyncAppSupport.bundle"
-
-if [[ ! -x "$product_path" ]]; then
-  echo "SwiftPM product is missing or not executable: $product_path" >&2
+if [[ ! -d "$D1_APP_PATH" ]]; then
+  echo "Verified unsigned release app is missing: $D1_APP_PATH" >&2
   exit 1
 fi
 
-if [[ ! -d "$resource_bundle_path" ]]; then
-  echo "SwiftPM AppSupport resource bundle is missing: $resource_bundle_path" >&2
-  exit 1
-fi
-
-mkdir -p "$CONTENTS_PATH/MacOS" "$CONTENTS_PATH/Resources"
-cp "$product_path" "$EXECUTABLE_PATH"
-cp "$INFO_PLIST_SOURCE" "$CONTENTS_PATH/Info.plist"
-cp -R "$RESOURCES_SOURCE/." "$CONTENTS_PATH/Resources/"
-cp -R "$resource_bundle_path" "$CONTENTS_PATH/Resources/"
-chmod 755 "$EXECUTABLE_PATH"
-
-/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$CONTENTS_PATH/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$CONTENTS_PATH/Info.plist"
+cp -R "$D1_APP_PATH" "$APP_PATH"
 
 # This is intentionally an ad-hoc signature for local development. It is not a
 # Developer ID signature and does not make the bundle notarized or Gatekeeper-ready.

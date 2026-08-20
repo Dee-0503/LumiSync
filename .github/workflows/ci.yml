@@ -7,6 +7,7 @@ on:
 jobs:
   swift-test:
     runs-on: macos-14
+    timeout-minutes: 10
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.2.app/Contents/Developer
     steps:
@@ -14,4 +15,39 @@ jobs:
       - name: Swift version
         run: swift --version
       - name: Run tests
-        run: swift test
+        run: swift test --scratch-path "${RUNNER_TEMP}/lumisync-swift-test"
+      - name: Verify real writes remain blocked
+        run: bash Scripts/verify-real-write-gate.sh
+
+  h1-process-safety:
+    runs-on: macos-14
+    timeout-minutes: 15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.2.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run H1 process safety tests
+        run: swift test --scratch-path "${RUNNER_TEMP}/lumisync-h1-process" --filter LumiSyncKeyboardProbeProcessTests.ThreeProcessRecoveryTests
+
+  bundle-structure:
+    runs-on: macos-14
+    timeout-minutes: 10
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.2.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify icon fixtures
+        run: swift test --scratch-path "${RUNNER_TEMP}/lumisync-icon-tests" --filter LumiSyncPackagingTests.IconFixtureTests
+      - name: Verify release bundle fixtures
+        run: swift test --scratch-path "${RUNNER_TEMP}/lumisync-bundle-tests" --filter LumiSyncPackagingTests.ReleaseBundleFixtureTests
+      - name: Build app icon
+        run: bash Scripts/build-app-icon.sh
+      - name: Build unsigned release-shaped app
+        run: VERSION=0.2.0-ci BUILD_NUMBER=${{ github.run_number }} bash Scripts/build-unsigned-release-app.sh
+      - name: Verify unsigned release-shaped app
+        run: >-
+          python3 Scripts/verify-release-bundle.py
+          --app build/unsigned-release/LumiSync.app
+          --manifest Packaging/LumiSync/NestedCode.json
+          --version 0.2.0-ci
+          --build-number ${{ github.run_number }}

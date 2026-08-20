@@ -21,6 +21,50 @@ notarization profiles.
 
 ## Package a release
 
+D1 produces a verified, unsigned release-shaped bundle; it is structure-only and
+must never be distributed as a release. Build the input bundle first:
+
+```bash
+VERSION=0.1.0 BUILD_NUMBER=1 \
+  bash Scripts/build-unsigned-release-app.sh
+```
+
+Then package the verified D1 bundle. The release script validates the bundle
+before checking signing and notarization prerequisites, and exits nonzero when
+any credential or release gate is unavailable:
+
+```bash
+VERSION=0.1.0 \
+APP_PATH=build/unsigned-release/LumiSync.app \
+NOTARYTOOL_PROFILE=LumiSync \
+bash Scripts/package-release.sh
+```
+
+D2 (later work) must add inside-out Developer ID signing, Hardened Runtime,
+identity and requirement verification, notarization, stapling, and Gatekeeper
+assessment. D3 must replace the development Cask version and `sha256 :no_check`
+only after explicit publication authorization.
+
+The auditable D1 structure gate builds and verifies the unsigned release-shaped
+bundle with:
+
+```bash
+bash Scripts/build-app-icon.sh
+VERSION=0.2.0-ci BUILD_NUMBER=1 \
+  bash Scripts/build-unsigned-release-app.sh
+python3 Scripts/verify-release-bundle.py \
+  --app build/unsigned-release/LumiSync.app \
+  --manifest Packaging/LumiSync/NestedCode.json \
+  --version 0.2.0-ci \
+  --build-number 1
+```
+
+This evidence covers icon generation, nested executable placement, bundle metadata,
+and unsigned bundle structure only. Developer ID signing, notarization, public
+GitHub Release creation, and Homebrew publication remain explicitly blocked behind
+D2/D3 and require separate authorization; CI does not receive signing secrets or
+pretend to exercise those gates.
+
 1. Build and sign `LumiSync.app` with the hardened runtime enabled.
 2. Store notarization credentials in the keychain, for example:
 
