@@ -109,6 +109,22 @@ final class BoundedProcessTests: XCTestCase {
         XCTAssertLessThan(elapsed, .seconds(1))
     }
 
+    func testUnverifiedRunnerFailsClosedWhenStandardInputIsBackpressured() async throws {
+        let result = await runner.run(
+            fixture(
+                command: "sleep 2",
+                standardInput: Data(repeating: 0x61, count: 4 * 1_024 * 1_024),
+                timeout: .milliseconds(150),
+                descendantPolicy: .unverified
+            )
+        )
+
+        XCTAssertEqual(result.termination, .timedOut)
+        XCTAssertFalse(result.cleanupVerified)
+        let pid = try XCTUnwrap(result.rootPID)
+        XCTAssertTrue(waitUntilGone(pid))
+    }
+
     func testCancellingRunnerTerminatesAndReapsOwnedProcess() async throws {
         let pidFile = FileManager.default.temporaryDirectory
             .appendingPathComponent("lumisync-cancelled-\(UUID().uuidString).pid")
@@ -158,6 +174,30 @@ final class BoundedProcessTests: XCTestCase {
         XCTAssertTrue(result.cleanupVerified)
         XCTAssertTrue(waitUntilGone(pid))
         XCTAssertLessThan(started.duration(to: .now), .seconds(1))
+    }
+
+    func testUnverifiedCancellationWhileStandardInputIsBackpressuredFailsClosed() async throws {
+        let pidFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lumisync-unverified-cancelled-input-\(UUID().uuidString).pid")
+        defer { try? FileManager.default.removeItem(at: pidFile) }
+        let request = fixture(
+            command: "printf '%s' $$ > \(pidFile.path); sleep 30",
+            standardInput: Data(repeating: 0x61, count: 4 * 1_024 * 1_024),
+            timeout: .seconds(2),
+            descendantPolicy: .unverified
+        )
+        let ownedRunner = BoundedOwnedProcessRunner()
+        let task = Task {
+            await ownedRunner.run(request)
+        }
+        let pid = try XCTUnwrap(waitForPID(in: pidFile))
+
+        task.cancel()
+        let result = await task.value
+
+        XCTAssertEqual(result.termination, .failed("cancelled"))
+        XCTAssertFalse(result.cleanupVerified)
+        XCTAssertTrue(waitUntilGone(pid))
     }
 
     func testCancellingRunnerWhileCollectingOutputReturnsPromptly() async throws {

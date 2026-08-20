@@ -138,8 +138,6 @@ final class ProcessHarness {
 
     private var environment: [String: String] {
         [
-            "LUMISYNC_H1_SUPERVISOR_PATH": supervisorURL.path,
-            "LUMISYNC_H1_WRITER_PATH": writerURL.path,
             "LUMISYNC_H1_FAKE_DEVICE_DIR": directory.path
         ]
     }

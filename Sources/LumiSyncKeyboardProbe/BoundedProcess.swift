@@ -202,7 +202,9 @@ public actor BoundedOwnedProcessRunner: OwnedProcessRunning {
                 let cleanup = await terminateAndReap(process)
                 process.closeOutput()
                 let descendantsVerified = await process.cleanupVerified()
-                let cleanupVerified = cleanup.didReap && descendantsVerified
+                let cleanupVerified = cleanup.didReap
+                    && descendantsVerified
+                    && request.descendantPolicy == .executableContractNoDescendants
                 return OwnedProcessResult(
                     termination: error is StandardInputWriteTimeout
                         ? .timedOut
@@ -249,7 +251,9 @@ public actor BoundedOwnedProcessRunner: OwnedProcessRunning {
                         stdout: Data(),
                         stderr: Data(),
                         rootPID: process.pid,
-                        cleanupVerified: cleanup.didReap && descendantsVerified
+                        cleanupVerified: cleanup.didReap
+                            && descendantsVerified
+                            && request.descendantPolicy == .executableContractNoDescendants
                     )
                 }
                 if clock.now >= deadline {
