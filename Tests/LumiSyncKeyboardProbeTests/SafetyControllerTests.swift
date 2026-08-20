@@ -51,6 +51,7 @@ final class SafetyControllerTests: XCTestCase {
 private actor BlockingSupervisor: BacklightSupervising {
     private var calls = 0
     private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
 
     func callCount() -> Int { calls }
 
@@ -61,14 +62,17 @@ private actor BlockingSupervisor: BacklightSupervising {
     }
 
     func release() {
+        released = true
         continuation?.resume()
         continuation = nil
     }
 
     func execute(_ request: BacklightRequest) async -> BacklightOperationResult {
         calls += 1
-        await withCheckedContinuation { continuation in
-            self.continuation = continuation
+        if !released {
+            await withCheckedContinuation { continuation in
+                self.continuation = continuation
+            }
         }
         switch request.operation {
         case .set(let value), .restore(let value):
