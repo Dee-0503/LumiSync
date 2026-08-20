@@ -26,7 +26,10 @@ public actor BacklightSafetySupervisor {
     private struct StageExecution {
         let result: BacklightOperationResult
         let timedOut: Bool
+        let cleanupVerified: Bool
     }
+
+    public static let recoveryBudgetNanoseconds: UInt64 = 5_000_000_000
 
     private static let maximumChildNanoseconds: UInt64 = 500_000_000
 
@@ -88,8 +91,12 @@ public actor BacklightSafetySupervisor {
                         primary: .timedOut(stage: .write),
                         restoration: .notRequired
                     ),
-                    timedOut: true
+                    timedOut: true,
+                    cleanupVerified: true
                 )
+            }
+            guard mutationExecution.cleanupVerified else {
+                return .failure(primary: .restorationUncertain, restoration: .uncertain)
             }
             let mutationResult = resolvedMutationResult(
                 mutationExecution,
@@ -97,17 +104,20 @@ public actor BacklightSafetySupervisor {
                 requestID: request.requestID
             )
 
+            let recoveryDeadline = ContinuousClock.now.advanced(
+                by: .nanoseconds(Int64(Self.recoveryBudgetNanoseconds))
+            )
             let restoreRequest = childRequest(
                 from: request,
                 operation: .restore(original),
-                remainingNanoseconds: remainingNanoseconds(until: operationDeadline)
+                remainingNanoseconds: remainingNanoseconds(until: recoveryDeadline)
             )
             let restoreExecution: StageExecution
             if let restoreRequest {
                 restoreExecution = await perform(
                     restoreRequest,
                     stage: .restore,
-                    operationDeadline: operationDeadline
+                    operationDeadline: recoveryDeadline
                 )
             } else {
                 restoreExecution = StageExecution(
@@ -115,7 +125,8 @@ public actor BacklightSafetySupervisor {
                         primary: .timedOut(stage: .restore),
                         restoration: .notRequired
                     ),
-                    timedOut: true
+                    timedOut: true,
+                    cleanupVerified: true
                 )
             }
             let restoration = restorationOutcome(
@@ -151,7 +162,8 @@ public actor BacklightSafetySupervisor {
         guard remaining > 0 else {
             return StageExecution(
                 result: .failure(primary: .timedOut(stage: stage), restoration: .notRequired),
-                timedOut: true
+                timedOut: true,
+                cleanupVerified: true
             )
         }
         let childNanoseconds = min(remaining, Self.maximumChildNanoseconds)
@@ -162,7 +174,8 @@ public actor BacklightSafetySupervisor {
         ) else {
             return StageExecution(
                 result: .failure(primary: .timedOut(stage: stage), restoration: .notRequired),
-                timedOut: true
+                timedOut: true,
+                cleanupVerified: true
             )
         }
         let encoded = (try? FramedJSONCodec().encode(childRequest)) ?? Data()
@@ -174,13 +187,15 @@ public actor BacklightSafetySupervisor {
                 timeout: .nanoseconds(Int64(childNanoseconds)),
                 environment: [
                     "LUMISYNC_H1_FAKE_DEVICE_DIR": configuration.fakeDeviceDirectory.path
-                ]
+                ],
+                descendantPolicy: .executableContractNoDescendants
             )
         )
         if process.termination == .timedOut {
             return StageExecution(
                 result: .failure(primary: .timedOut(stage: stage), restoration: .notRequired),
-                timedOut: true
+                timedOut: true,
+                cleanupVerified: process.cleanupVerified
             )
         }
         guard process.termination == .exited,
@@ -188,14 +203,19 @@ public actor BacklightSafetySupervisor {
               process.cleanupVerified else {
             return StageExecution(
                 result: .failure(primary: .writerFailed, restoration: .notRequired),
-                timedOut: false
+                timedOut: false,
+                cleanupVerified: process.cleanupVerified
             )
         }
         let result = (try? FramedJSONCodec().decode(
             BacklightOperationResult.self,
             from: process.stdout
         )) ?? .failure(primary: .protocolViolation, restoration: .notRequired)
-        return StageExecution(result: result, timedOut: false)
+        return StageExecution(
+            result: result,
+            timedOut: false,
+            cleanupVerified: true
+        )
     }
 
     private func resolvedMutationResult(

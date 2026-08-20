@@ -28,14 +28,15 @@ public enum CoreBrightnessBackendError: Error, CustomStringConvertible {
 }
 
 public protocol ObjectiveCMetadataProviding: AnyObject {
-    func frameworkIsPresent(at path: String) -> Bool
+    func loadFramework(at path: String) -> Bool
     func classIsPresent(named name: String) -> Bool
     func typeEncoding(classNamed name: String, selectorNamed selectorName: String) -> String?
 }
 
 private final class RuntimeObjectiveCMetadataProvider: ObjectiveCMetadataProviding {
-    func frameworkIsPresent(at path: String) -> Bool {
-        Bundle(path: path) != nil
+    func loadFramework(at path: String) -> Bool {
+        guard let bundle = Bundle(path: path) else { return false }
+        return bundle.isLoaded || bundle.load()
     }
 
     func classIsPresent(named name: String) -> Bool {
@@ -56,9 +57,16 @@ private final class RuntimeObjectiveCMetadataProvider: ObjectiveCMetadataProvidi
     }
 }
 
+protocol CoreBrightnessRuntimeProviding: AnyObject {
+    func keyboardIDs() throws -> [UInt64]
+    func isBuiltIn(keyboardID: UInt64) throws -> Bool
+    func brightness(keyboardID: UInt64) throws -> Float
+    func setBrightness(_ brightness: Float, keyboardID: UInt64) throws -> Bool
+}
+
 public final class CoreBrightnessKeyboardBacklightBackend: KeyboardBacklightBackend {
-    private static let frameworkPath = "/System/Library/PrivateFrameworks/CoreBrightness.framework"
-    private static let clientClassName = "KeyboardBrightnessClient"
+    fileprivate static let frameworkPath = "/System/Library/PrivateFrameworks/CoreBrightness.framework"
+    fileprivate static let clientClassName = "KeyboardBrightnessClient"
     private static let inspectedSelectorNames = [
         "copyKeyboardBacklightIDs",
         "isKeyboardBuiltIn:",
@@ -66,23 +74,14 @@ public final class CoreBrightnessKeyboardBacklightBackend: KeyboardBacklightBack
         "setBrightness:forKeyboard:"
     ]
 
-    private let clientClass: AnyClass
-    private let client: AnyObject
+    private let runtimeProvider: CoreBrightnessRuntimeProviding
 
     public init() throws {
-        guard let bundle = Bundle(path: Self.frameworkPath), bundle.load() else {
-            throw CoreBrightnessBackendError.frameworkUnavailable(Self.frameworkPath)
-        }
-        guard let clientClass = NSClassFromString(Self.clientClassName) else {
-            throw CoreBrightnessBackendError.classUnavailable(Self.clientClassName)
-        }
+        runtimeProvider = try RuntimeCoreBrightnessProvider()
+    }
 
-        self.clientClass = clientClass
-        client = try Self.makeClient(clientClass: clientClass)
-        try requireSelector("copyKeyboardBacklightIDs")
-        try requireSelector("isKeyboardBuiltIn:")
-        try requireSelector("brightnessForKeyboard:")
-        try requireSelector("setBrightness:forKeyboard:")
+    init(runtimeProvider: CoreBrightnessRuntimeProviding) throws {
+        self.runtimeProvider = runtimeProvider
     }
 
     public static func inspectSignatures() throws -> CoreBrightnessSignatureInspection {
@@ -92,7 +91,7 @@ public final class CoreBrightnessKeyboardBacklightBackend: KeyboardBacklightBack
     public static func inspectSignatures(
         metadataProvider: ObjectiveCMetadataProviding
     ) throws -> CoreBrightnessSignatureInspection {
-        let frameworkPresent = metadataProvider.frameworkIsPresent(at: frameworkPath)
+        let frameworkPresent = metadataProvider.loadFramework(at: frameworkPath)
         let classPresent = frameworkPresent
             && metadataProvider.classIsPresent(named: clientClassName)
         let signatures = classPresent ? inspectedSelectorNames.compactMap { selectorName in
@@ -111,6 +110,61 @@ public final class CoreBrightnessKeyboardBacklightBackend: KeyboardBacklightBack
     }
 
     public func keyboardIDs() throws -> [UInt64] {
+        try runtimeProvider.keyboardIDs()
+    }
+
+    public func isBuiltIn(keyboardID: UInt64) throws -> Bool {
+        try runtimeProvider.isBuiltIn(keyboardID: keyboardID)
+    }
+
+    public func brightness(keyboardID: UInt64) throws -> Float {
+        try runtimeProvider.brightness(keyboardID: keyboardID)
+    }
+
+    public func setBrightness(_ brightness: Float, keyboardID: UInt64) throws {
+        throw CoreBrightnessBackendError.writeRejected(
+            keyboardID: keyboardID,
+            brightness: brightness
+        )
+    }
+
+    public func restoreBrightness(_ brightness: Float, keyboardID: UInt64) throws {
+        throw CoreBrightnessBackendError.writeRejected(
+            keyboardID: keyboardID,
+            brightness: brightness
+        )
+    }
+}
+
+private final class RuntimeCoreBrightnessProvider: CoreBrightnessRuntimeProviding {
+    private let clientClass: AnyClass
+    private let client: AnyObject
+
+    init() throws {
+        guard let bundle = Bundle(path: CoreBrightnessKeyboardBacklightBackend.frameworkPath),
+              bundle.load()
+        else {
+            throw CoreBrightnessBackendError.frameworkUnavailable(
+                CoreBrightnessKeyboardBacklightBackend.frameworkPath
+            )
+        }
+        guard let clientClass = NSClassFromString(
+            CoreBrightnessKeyboardBacklightBackend.clientClassName
+        ) else {
+            throw CoreBrightnessBackendError.classUnavailable(
+                CoreBrightnessKeyboardBacklightBackend.clientClassName
+            )
+        }
+
+        self.clientClass = clientClass
+        client = try Self.makeClient(clientClass: clientClass)
+        try requireSelector("copyKeyboardBacklightIDs")
+        try requireSelector("isKeyboardBuiltIn:")
+        try requireSelector("brightnessForKeyboard:")
+        try requireSelector("setBrightness:forKeyboard:")
+    }
+
+    func keyboardIDs() throws -> [UInt64] {
         let value = try invokeObject(selectorName: "copyKeyboardBacklightIDs")
         guard let ids = value as? [NSNumber] else {
             throw CoreBrightnessBackendError.malformedKeyboardIDs
@@ -118,20 +172,31 @@ public final class CoreBrightnessKeyboardBacklightBackend: KeyboardBacklightBack
         return ids.map(\.uint64Value)
     }
 
-    public func isBuiltIn(keyboardID: UInt64) throws -> Bool {
+    func isBuiltIn(keyboardID: UInt64) throws -> Bool {
         try invokeBool(selectorName: "isKeyboardBuiltIn:", keyboardID: keyboardID)
     }
 
-    public func brightness(keyboardID: UInt64) throws -> Float {
+    func brightness(keyboardID: UInt64) throws -> Float {
         try invokeFloat(selectorName: "brightnessForKeyboard:", keyboardID: keyboardID)
     }
 
-    public func setBrightness(_ brightness: Float, keyboardID: UInt64) throws {
-        try writeBrightness(brightness, keyboardID: keyboardID)
-    }
+    func setBrightness(_ brightness: Float, keyboardID: UInt64) throws -> Bool {
+        guard brightness.isFinite, (0.0...1.0).contains(brightness) else {
+            throw CoreBrightnessBackendError.writeRejected(
+                keyboardID: keyboardID,
+                brightness: brightness
+            )
+        }
 
-    public func restoreBrightness(_ brightness: Float, keyboardID: UInt64) throws {
-        try writeBrightness(brightness, keyboardID: keyboardID)
+        let selectorName = "setBrightness:forKeyboard:"
+        let (selector, implementation) = try implementation(selectorName: selectorName)
+        typealias Function = @convention(c) (AnyObject, Selector, Float, UInt64) -> Bool
+        return unsafeBitCast(implementation, to: Function.self)(
+            client,
+            selector,
+            brightness,
+            keyboardID
+        )
     }
 
     private static func makeClient(clientClass: AnyClass) throws -> AnyObject {
@@ -192,30 +257,5 @@ public final class CoreBrightnessKeyboardBacklightBackend: KeyboardBacklightBack
         let (selector, implementation) = try implementation(selectorName: selectorName)
         typealias Function = @convention(c) (AnyObject, Selector, UInt64) -> Float
         return unsafeBitCast(implementation, to: Function.self)(client, selector, keyboardID)
-    }
-
-    private func writeBrightness(_ brightness: Float, keyboardID: UInt64) throws {
-        guard brightness.isFinite, (0.0...1.0).contains(brightness) else {
-            throw CoreBrightnessBackendError.writeRejected(
-                keyboardID: keyboardID,
-                brightness: brightness
-            )
-        }
-
-        let selectorName = "setBrightness:forKeyboard:"
-        let (selector, implementation) = try implementation(selectorName: selectorName)
-        typealias Function = @convention(c) (AnyObject, Selector, Float, UInt64) -> Bool
-        let accepted = unsafeBitCast(implementation, to: Function.self)(
-            client,
-            selector,
-            brightness,
-            keyboardID
-        )
-        guard accepted else {
-            throw CoreBrightnessBackendError.writeRejected(
-                keyboardID: keyboardID,
-                brightness: brightness
-            )
-        }
     }
 }

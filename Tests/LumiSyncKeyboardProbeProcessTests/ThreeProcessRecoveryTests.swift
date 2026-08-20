@@ -331,6 +331,37 @@ final class ThreeProcessRecoveryTests: XCTestCase {
         }
     }
 
+    func testControllerDeadlineLeavesRecoveryBudgetForSupervisorRestore() throws {
+        let harness = try ProcessHarness(initialValue: 0.37, pausedAt: .writeReadback)
+        let request = try harness.makeRequest(
+            requestID: "controller-deadline-recovery",
+            operation: .set(try NormalizedBacklightValue(0.5)),
+            deadlineNanoseconds: 550_000_000
+        )
+        let scenario = try harness.startScenario(
+            input: try FramedJSONCodec().encode(request),
+            outerTimeout: .seconds(3)
+        )
+
+        try scenario.waitForHangBarrier(
+            stage: .writeReadback,
+            requestID: request.requestID
+        )
+        let result = try scenario.finish()
+
+        XCTAssertEqual(result.termination, .exited)
+        XCTAssertEqual(
+            try scenario.currentValue(),
+            try NormalizedBacklightValue(0.37)
+        )
+        let operationCategories = try scenario.journalEntries()
+            .filter { $0.processRole == .writer }
+            .map(\.operationCategory)
+        XCTAssertTrue(operationCategories.contains(.restore))
+        XCTAssertEqual(operationCategories.last, .read)
+        try scenario.assertNoOwnedProcessesRemain()
+    }
+
     func testControllerSignalsLeaveSupervisorToRestoreOriginalValue() throws {
         for signal in [SIGINT, SIGTERM, SIGABRT, SIGKILL] {
             let harness = try ProcessHarness(initialValue: 0.37, pausedAt: .writeReadback)

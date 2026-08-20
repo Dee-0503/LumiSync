@@ -102,12 +102,113 @@ final class QualificationTests: XCTestCase {
             ObjectiveCSelectorSignature(name: "brightnessForKeyboard:", typeEncoding: "f@:Q"),
             ObjectiveCSelectorSignature(name: "setBrightness:forKeyboard:", typeEncoding: "B@:fQ")
         ])
-        XCTAssertEqual(provider.requestedSelectors, [
-            "copyKeyboardBacklightIDs",
-            "isKeyboardBuiltIn:",
-            "brightnessForKeyboard:",
-            "setBrightness:forKeyboard:"
+        XCTAssertEqual(provider.events, [
+            "load",
+            "class:KeyboardBrightnessClient",
+            "encoding:copyKeyboardBacklightIDs",
+            "encoding:isKeyboardBuiltIn:",
+            "encoding:brightnessForKeyboard:",
+            "encoding:setBrightness:forKeyboard:"
         ])
+    }
+
+    func testCoreBrightnessBackendConstructionIsReadOnly() throws {
+        let backend = try CoreBrightnessKeyboardBacklightBackend(
+            runtimeProvider: RecordingCoreBrightnessRuntimeProvider()
+        )
+
+        XCTAssertEqual(try backend.keyboardIDs(), [42])
+        XCTAssertTrue(try backend.isBuiltIn(keyboardID: 42))
+        XCTAssertEqual(try backend.brightness(keyboardID: 42), 0.37)
+    }
+
+    func testCoreBrightnessBackendRejectsEveryWriteWithoutCallingRuntime() throws {
+        let runtime = RecordingCoreBrightnessRuntimeProvider()
+        let backend = try CoreBrightnessKeyboardBacklightBackend(runtimeProvider: runtime)
+
+        XCTAssertThrowsError(try backend.setBrightness(0.5, keyboardID: 42))
+        XCTAssertThrowsError(try backend.restoreBrightness(0.37, keyboardID: 42))
+        XCTAssertEqual(runtime.writeCalls, 0)
+    }
+
+    func testQualificationAcceptsRuntimeOffsetsAfterCanonicalizingABI() {
+        let runtime = fixture(selectorSignatures: [
+            ObjectiveCSelectorSignature(name: "copyKeyboardBacklightIDs", typeEncoding: "@16@0:8"),
+            ObjectiveCSelectorSignature(name: "isKeyboardBuiltIn:", typeEncoding: "B24@0:8Q16"),
+            ObjectiveCSelectorSignature(name: "brightnessForKeyboard:", typeEncoding: "f24@0:8Q16"),
+            ObjectiveCSelectorSignature(name: "setBrightness:forKeyboard:", typeEncoding: "B28@0:8f16Q20")
+        ])
+
+        XCTAssertEqual(
+            BacklightQualificationPolicy().evaluate(saved: runtime, current: runtime),
+            .qualified(runtime)
+        )
+    }
+
+    func testQualificationRejectsDigitsThatBelongToABITypes() {
+        let incompatibleEncodings = [
+            "B28@0:8f16[16Q]20",
+            "B28@0:8f16b1",
+            "B28@0:8f16^{Pair=Q16}",
+            "B28@0:8f16{Pair=Q16}",
+            "B28@0:8f16(Pair=Q16)"
+        ]
+
+        for encoding in incompatibleEncodings {
+            let current = fixture(setterEncoding: encoding)
+            XCTAssertEqual(
+                BacklightQualificationPolicy().evaluate(saved: fixture(), current: current),
+                .unqualified(reason: "Current CoreBrightness selector set or ABI is unsupported."),
+                encoding
+            )
+        }
+    }
+
+    func testQualificationRejectsMixedOrPartiallyFramedABIEncodings() {
+        let unsupportedEncodings = [
+            "B28@:fQ",
+            "B28@0:8f16Q",
+            "B@:f16Q20",
+            "B28@0:8fQ20",
+            "B28@0:8f16Q20 ",
+            "B28@0:8f16Q20v",
+            "B28@0::8f16Q20"
+        ]
+
+        for encoding in unsupportedEncodings {
+            XCTAssertEqual(
+                BacklightQualificationPolicy().evaluate(
+                    saved: fixture(),
+                    current: fixture(setterEncoding: encoding)
+                ),
+                .unqualified(reason: "Current CoreBrightness selector set or ABI is unsupported."),
+                encoding
+            )
+        }
+    }
+
+    func testQualificationFailsClosedForMalformedOrUnsupportedABIEncodings() {
+        let malformedEncodings = [
+            "B28@0:8f16[16Q",
+            "B28@0:8f16{Pair=Q",
+            "B28@0:8f16(Pair=Q",
+            "B28@0:8f16^",
+            "B28@0:8f16?",
+            "B28@0:8f16@?20",
+            "B28@0:8f16rQ20",
+            "B²@³:⁴f⁵Q⁶"
+        ]
+
+        for encoding in malformedEncodings {
+            XCTAssertEqual(
+                BacklightQualificationPolicy().evaluate(
+                    saved: fixture(),
+                    current: fixture(setterEncoding: encoding)
+                ),
+                .unqualified(reason: "Current CoreBrightness selector set or ABI is unsupported."),
+                encoding
+            )
+        }
     }
 }
 
@@ -139,24 +240,47 @@ private extension QualificationTests {
     }
 }
 
+private final class RecordingCoreBrightnessRuntimeProvider: CoreBrightnessRuntimeProviding {
+    private(set) var writeCalls = 0
+
+    func keyboardIDs() throws -> [UInt64] {
+        [42]
+    }
+
+    func isBuiltIn(keyboardID: UInt64) throws -> Bool {
+        true
+    }
+
+    func brightness(keyboardID: UInt64) throws -> Float {
+        0.37
+    }
+
+    func setBrightness(_ brightness: Float, keyboardID: UInt64) throws -> Bool {
+        writeCalls += 1
+        return true
+    }
+}
+
 private final class RecordingObjectiveCMetadataProvider: ObjectiveCMetadataProviding {
     private let encodings: [String: String]
-    private(set) var requestedSelectors: [String] = []
+    private(set) var events: [String] = []
 
     init(encodings: [String: String]) {
         self.encodings = encodings
     }
 
-    func frameworkIsPresent(at path: String) -> Bool {
-        true
+    func loadFramework(at path: String) -> Bool {
+        events.append("load")
+        return true
     }
 
     func classIsPresent(named name: String) -> Bool {
-        true
+        events.append("class:\(name)")
+        return true
     }
 
     func typeEncoding(classNamed name: String, selectorNamed selectorName: String) -> String? {
-        requestedSelectors.append(selectorName)
+        events.append("encoding:\(selectorName)")
         return encodings[selectorName]
     }
 }

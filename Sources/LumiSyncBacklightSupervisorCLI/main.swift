@@ -14,18 +14,20 @@ func emit(_ result: BacklightOperationResult) -> Never {
     }
 }
 
-let input = FileHandle.standardInput.readDataToEndOfFile()
 let request: BacklightRequest
 do {
-    request = try codec.decode(BacklightRequest.self, from: input)
+    request = try FramedJSONReader().read(
+        BacklightRequest.self,
+        from: .standardInput
+    )
 } catch {
     emit(.failure(primary: .protocolViolation, restoration: .notRequired))
 }
 
 let environment = ProcessInfo.processInfo.environment
-guard let writerPath = environment["LUMISYNC_H1_WRITER_PATH"],
+guard let executableURL = Bundle.main.executableURL,
+      let writerURL = try? TrustedH1Helper.resolve(.writer, relativeTo: executableURL),
       let directoryPath = environment["LUMISYNC_H1_FAKE_DEVICE_DIR"],
-      !writerPath.isEmpty,
       !directoryPath.isEmpty else {
     emit(.failure(primary: .rejected, restoration: .notRequired))
 }
@@ -33,7 +35,7 @@ guard let writerPath = environment["LUMISYNC_H1_WRITER_PATH"],
 let supervisor = BacklightSafetySupervisor(
     runner: BoundedOwnedProcessRunner(),
     configuration: BacklightSupervisorConfiguration(
-        writerExecutableURL: URL(fileURLWithPath: writerPath),
+        writerExecutableURL: writerURL,
         fakeDeviceDirectory: URL(fileURLWithPath: directoryPath, isDirectory: true)
     )
 )

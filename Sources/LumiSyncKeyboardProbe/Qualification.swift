@@ -84,7 +84,55 @@ public struct BacklightQualificationPolicy: Sendable {
         else {
             return false
         }
-        return identity.selectorSignatures == Self.requiredSelectorSignatures
+        return signaturesMatchRequired(identity.selectorSignatures)
+    }
+
+    private func signaturesMatchRequired(
+        _ actual: [ObjectiveCSelectorSignature]
+    ) -> Bool {
+        guard actual.count == Self.requiredSelectorSignatures.count else {
+            return false
+        }
+        return zip(actual, Self.requiredSelectorSignatures).allSatisfy { actual, required in
+            actual.name == required.name
+                && typeEncoding(actual.typeEncoding, matches: required.typeEncoding)
+        }
+    }
+
+    private func typeEncoding(_ actual: String, matches required: String) -> Bool {
+        if actual == required {
+            return true
+        }
+
+        let actualBytes = Array(actual.utf8)
+        let requiredBytes = Array(required.utf8)
+        guard actualBytes.allSatisfy({ $0 < 0x80 }) else {
+            return false
+        }
+
+        var actualIndex = 0
+        for requiredToken in requiredBytes {
+            guard actualIndex < actualBytes.count,
+                  actualBytes[actualIndex] == requiredToken
+            else {
+                return false
+            }
+            actualIndex += 1
+
+            let offsetStart = actualIndex
+            while actualIndex < actualBytes.count,
+                  isASCIIDigit(actualBytes[actualIndex]) {
+                actualIndex += 1
+            }
+            guard actualIndex > offsetStart else {
+                return false
+            }
+        }
+        return actualIndex == actualBytes.count
+    }
+
+    private func isASCIIDigit(_ byte: UInt8) -> Bool {
+        (0x30...0x39).contains(byte)
     }
 }
 

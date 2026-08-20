@@ -241,11 +241,13 @@ public final class FileBackedFakeBacklightDevice {
     public func read(requestID: BacklightRequestID) throws -> NormalizedBacklightValue {
         try withLock {
             let value = try readStateLocked()
+            let records = try recoverJournalLocked(state: value)
             try appendJournalLocked(
                 requestID: requestID,
                 category: .read,
                 value: value,
-                processID: getpid()
+                processID: getpid(),
+                existingRecords: records
             )
             return value
         }
@@ -504,9 +506,10 @@ public final class FileBackedFakeBacklightDevice {
         requestID: BacklightRequestID,
         category: FakeBacklightOperationCategory,
         value: NormalizedBacklightValue,
-        processID: Int32
+        processID: Int32,
+        existingRecords: [FakeBacklightJournalEntry]? = nil
     ) throws {
-        let existing = try journalRecordsLocked(repairingIncompleteTail: true)
+        let existing = try existingRecords ?? journalRecordsLocked(repairingIncompleteTail: true)
         let entry = FakeBacklightJournalEntry(
             sequenceNumber: try nextSequence(after: existing),
             requestID: requestID,

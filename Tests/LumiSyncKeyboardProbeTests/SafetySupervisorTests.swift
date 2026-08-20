@@ -136,6 +136,64 @@ final class SafetySupervisorTests: XCTestCase {
         }
     }
 
+    func testSupervisorUsesIndependentRecoveryBudgetAfterMutationTimeout() async throws {
+        let runner = ScriptedOwnedProcessRunner(
+            processResults: [
+                writerProcessResult(0.37),
+                timedOutProcessResult(),
+                writerProcessResult(0.37)
+            ]
+        )
+        let supervisor = BacklightSafetySupervisor(runner: runner, configuration: configuration())
+        let parentNanoseconds: UInt64 = 100_000_000
+        let request = BacklightRequest(
+            requestID: try BacklightRequestID(rawValue: "recovery-budget-test"),
+            operation: .set(try NormalizedBacklightValue(0.5)),
+            deadline: try BacklightDeadline(remainingNanoseconds: parentNanoseconds)
+        )
+
+        let result = await supervisor.execute(request)
+
+        XCTAssertEqual(
+            result,
+            .failure(
+                primary: .timedOut(stage: .write),
+                restoration: .verified(try NormalizedBacklightValue(0.37))
+            )
+        )
+        let requests = await runner.requests()
+        XCTAssertEqual(requests.count, 3)
+        let restoreRequest = try FramedJSONCodec().decode(
+            BacklightRequest.self,
+            from: requests[2].standardInput
+        )
+        XCTAssertGreaterThan(restoreRequest.deadline.remainingNanoseconds, parentNanoseconds)
+        XCTAssertLessThanOrEqual(
+            restoreRequest.deadline.remainingNanoseconds,
+            BacklightSafetySupervisor.recoveryBudgetNanoseconds
+        )
+    }
+
+    func testSupervisorDoesNotVerifyRecoveryAfterUnverifiedWriterTimeout() async throws {
+        let runner = ScriptedOwnedProcessRunner(
+            processResults: [
+                writerProcessResult(0.37),
+                timedOutProcessResult(cleanupVerified: false),
+                writerProcessResult(0.37)
+            ]
+        )
+        let supervisor = BacklightSafetySupervisor(runner: runner, configuration: configuration())
+
+        let result = await supervisor.execute(try makeSetRequest(0.5))
+
+        XCTAssertEqual(
+            result,
+            .failure(primary: .restorationUncertain, restoration: .uncertain)
+        )
+        let history = await runner.history()
+        XCTAssertEqual(history, [.read, .set(0.5)])
+    }
+
     func testRestoreTimeoutWithUnreadableJournalIsUncertain() async throws {
         let directory = try makeTemporaryFakeDevice()
         try Data("not-json\n".utf8).write(
@@ -225,14 +283,16 @@ final class SafetySupervisorTests: XCTestCase {
         return directory
     }
 
-    private func timedOutProcessResult() -> OwnedProcessResult {
+    private func timedOutProcessResult(
+        cleanupVerified: Bool = true
+    ) -> OwnedProcessResult {
         OwnedProcessResult(
             termination: .timedOut,
             exitStatus: nil,
             stdout: Data(),
             stderr: Data(),
             rootPID: nil,
-            cleanupVerified: true
+            cleanupVerified: cleanupVerified
         )
     }
 

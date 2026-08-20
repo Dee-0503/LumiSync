@@ -14,6 +14,13 @@ from pathlib import Path, PurePosixPath
 FORBIDDEN_STRINGS = (".build", "/Users/", "/private/tmp/")
 CODE_ROOT_DIRECTORIES = ("Contents/MacOS", "Contents/Helpers", "Contents/Frameworks", "Contents/PlugIns", "Contents/XPCServices")
 BUNDLE_SUFFIXES = (".app", ".appex", ".xpc", ".framework", ".bundle")
+REQUIRED_EXECUTABLES = {
+    "app": ("Contents/MacOS/LumiSync", "LumiSyncApp"),
+    "controller": ("Contents/Helpers/lumisync-backlight-controller", "lumisync-backlight-controller"),
+    "supervisor": ("Contents/Helpers/lumisync-backlight-supervisor", "lumisync-backlight-supervisor"),
+    "writer": ("Contents/Helpers/lumisync-backlight-writer", "lumisync-backlight-writer"),
+}
+ALLOWED_EXECUTABLE_ROLES = {*REQUIRED_EXECUTABLES, "framework", "appex", "xpc", "bundle"}
 MOCK_ARCH_PREFIX = "MOCK_MACHO_ARCH="
 MOCK_DEPENDENCY_PREFIX = "MOCK_DEPENDENCY="
 MOCK_RPATH_PREFIX = "MOCK_RPATH="
@@ -45,6 +52,8 @@ def load_manifest(path: Path) -> list[dict[str, str]]:
             raise ManifestError("each executable must contain only path, product, and role")
         if not all(isinstance(entry[key], str) and entry[key] for key in entry):
             raise ManifestError("executable path, product, and role must be nonempty strings")
+        if any(any(ord(character) < 0x20 or ord(character) == 0x7F for character in entry[key]) for key in entry):
+            raise ManifestError("manifest fields must not contain control characters")
 
         path_value = entry["path"]
         manifest_path = PurePosixPath(path_value)
@@ -56,6 +65,8 @@ def load_manifest(path: Path) -> list[dict[str, str]]:
             raise ManifestError(f"executable path must use canonical relative syntax: {path_value}")
         if path_value in paths:
             raise ManifestError(f"duplicate executable path: {path_value}")
+        if entry["role"] not in ALLOWED_EXECUTABLE_ROLES:
+            raise ManifestError(f"unknown executable role: {entry['role']}")
         if entry["role"] in roles:
             raise ManifestError(f"duplicate executable role: {entry['role']}")
         if len(manifest_path.parts) < 3 or manifest_path.parts[0] != "Contents":
@@ -64,6 +75,19 @@ def load_manifest(path: Path) -> list[dict[str, str]]:
         paths.add(path_value)
         roles.add(entry["role"])
         parsed.append(entry)
+
+    entries_by_role = {entry["role"]: entry for entry in parsed}
+    missing_roles = [role for role in REQUIRED_EXECUTABLES if role not in entries_by_role]
+    if missing_roles:
+        raise ManifestError(
+            "missing required executable roles: " + ", ".join(missing_roles)
+        )
+    for role, (required_path, required_product) in REQUIRED_EXECUTABLES.items():
+        entry = entries_by_role[role]
+        if entry["path"] != required_path:
+            raise ManifestError(f"required executable role {role} must use path {required_path}")
+        if entry["product"] != required_product:
+            raise ManifestError(f"required executable role {role} must use product {required_product}")
     return parsed
 
 
@@ -285,13 +309,33 @@ def validate_bundle(
     if str(found_build) != build_number:
         errors.append(f"CFBundleVersion must be {build_number}, found {found_build}")
 
+    bundle_executable = info.get("CFBundleExecutable")
+    if not isinstance(bundle_executable, str) or not bundle_executable:
+        errors.append("CFBundleExecutable must name the app executable")
+    else:
+        required_app_path = f"Contents/MacOS/{bundle_executable}"
+        app_entry = next(entry for entry in entries if entry["role"] == "app")
+        if app_entry["path"] != required_app_path:
+            errors.append(f"app executable must match CFBundleExecutable: {required_app_path}")
+
     icon_name = info.get("CFBundleIconFile")
     if not isinstance(icon_name, str) or not icon_name:
         errors.append("CFBundleIconFile must name an icon resource")
     else:
-        icon_file = icon_name if Path(icon_name).suffix else f"{icon_name}.icns"
-        if not (app / "Contents/Resources" / icon_file).is_file():
-            errors.append(f"missing icon resource: Contents/Resources/{icon_file}")
+        icon_path = PurePosixPath(icon_name)
+        if icon_path.is_absolute() or ".." in icon_path.parts or "\\" in icon_name or icon_path.as_posix() != icon_name:
+            errors.append("CFBundleIconFile must be a relative resource name")
+        else:
+            icon_file = icon_name if icon_path.suffix else f"{icon_name}.icns"
+            icon_relative = f"Contents/Resources/{icon_file}"
+            icon_resource = app / icon_relative
+            try:
+                icon_mode = icon_resource.lstat().st_mode
+            except OSError:
+                errors.append(f"missing icon resource: {icon_relative}")
+            else:
+                if not stat.S_ISREG(icon_mode) or stat.S_ISLNK(icon_mode) or first_symlink_component(app, icon_relative) is not None:
+                    errors.append(f"icon resource must be a regular non-symlink file: {icon_relative}")
 
     resources = app / "Contents/Resources"
     localization_bundles = list(resources.glob("*.bundle")) if resources.is_dir() else []
