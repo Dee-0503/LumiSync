@@ -460,16 +460,16 @@ private final class SpawnedProcess: @unchecked Sendable {
     private let descendantTracker: DescendantProcessTracker
 
     init(request: OwnedProcessRequest) throws {
-        var inputPipe = [Int32](repeating: 0, count: 2)
-        var outputPipe = [Int32](repeating: 0, count: 2)
-        var errorPipe = [Int32](repeating: 0, count: 2)
+        var inputPipe = [Int32](repeating: -1, count: 2)
+        var outputPipe = [Int32](repeating: -1, count: 2)
+        var errorPipe = [Int32](repeating: -1, count: 2)
         guard pipe(&inputPipe) == 0,
               pipe(&outputPipe) == 0,
               pipe(&errorPipe) == 0
         else {
-            inputPipe.forEach { _ = close($0) }
-            outputPipe.forEach { _ = close($0) }
-            errorPipe.forEach { _ = close($0) }
+            Self.closeDescriptors(inputPipe)
+            Self.closeDescriptors(outputPipe)
+            Self.closeDescriptors(errorPipe)
             throw SpawnedProcessError.pipe(errno)
         }
         do {
@@ -477,9 +477,9 @@ private final class SpawnedProcess: @unchecked Sendable {
             try Self.makeNonblocking(errorPipe[0])
         } catch {
             let code = errno
-            inputPipe.forEach { _ = close($0) }
-            outputPipe.forEach { _ = close($0) }
-            errorPipe.forEach { _ = close($0) }
+            Self.closeDescriptors(inputPipe)
+            Self.closeDescriptors(outputPipe)
+            Self.closeDescriptors(errorPipe)
             throw SpawnedProcessError.pipe(code)
         }
 
@@ -562,9 +562,9 @@ private final class SpawnedProcess: @unchecked Sendable {
             }
         }
         guard result == 0 else {
-            inputPipe.forEach { _ = close($0) }
-            outputPipe.forEach { _ = close($0) }
-            errorPipe.forEach { _ = close($0) }
+            Self.closeDescriptors(inputPipe)
+            Self.closeDescriptors(outputPipe)
+            Self.closeDescriptors(errorPipe)
             throw SpawnedProcessError.spawn(result)
         }
 
@@ -582,6 +582,12 @@ private final class SpawnedProcess: @unchecked Sendable {
         }
         error.readabilityHandler = { [weak self] handle in
             self?.consumeAvailableData(from: handle, isStdout: false)
+        }
+    }
+
+    private static func closeDescriptors(_ descriptors: [Int32]) {
+        for descriptor in descriptors where descriptor >= 0 {
+            _ = close(descriptor)
         }
     }
 
