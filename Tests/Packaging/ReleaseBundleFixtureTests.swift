@@ -378,6 +378,117 @@ final class ReleaseBundleFixtureTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: app.appendingPathComponent(relocatedController).path))
     }
 
+    func testBuilderRejectsInvalidManifestBeforeInvokingSwiftBuild() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("InvalidManifestBuilder-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let manifest = root.appendingPathComponent("NestedCode.json")
+        try "{not-json".write(to: manifest, atomically: true, encoding: .utf8)
+        let fakeBin = root.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: fakeBin, withIntermediateDirectories: true)
+        let invocationMarker = root.appendingPathComponent("swift-was-invoked")
+        let fakeSwift = fakeBin.appendingPathComponent("swift")
+        try "#!/bin/sh\ntouch \"\(invocationMarker.path)\"\nexit 0\n".write(
+            to: fakeSwift, atomically: true, encoding: .utf8
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeSwift.path)
+
+        let result = try runBuilder(
+            buildDirectory: root.appendingPathComponent("build", isDirectory: true),
+            version: "0.2.0-dev",
+            buildNumber: "2",
+            manifest: manifest,
+            environment: ["PATH": "\(fakeBin.path):/usr/bin:/bin"]
+        )
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.contains("cannot read manifest"), result.output)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: invocationMarker.path), result.output)
+    }
+
+    func testBuilderRejectsTabInjectedManifestFieldBeforeWritingOutsideApp() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TabInjectedManifestBuilder-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let externalDirectory = root.appendingPathComponent("external", isDirectory: true)
+        try FileManager.default.createDirectory(at: externalDirectory, withIntermediateDirectories: true)
+        let resourceLink = repositoryRoot.appendingPathComponent("Packaging/LumiSync/Resources/staging-escape")
+        try? FileManager.default.removeItem(at: resourceLink)
+        try FileManager.default.createSymbolicLink(at: resourceLink, withDestinationURL: externalDirectory)
+        defer { try? FileManager.default.removeItem(at: resourceLink) }
+
+        let escapedPath = "Contents/Resources/staging-escape/tab-escaped-product"
+        let entries = validEntries.map { entry in
+            ["path": entry.path, "product": entry.product, "role": entry.role]
+        } + [[
+            "path": "Contents/Resources/declared-product",
+            "product": "LumiSyncApp\t\(escapedPath)\tbundle",
+            "role": "bundle"
+        ]]
+        let manifestData = try JSONSerialization.data(
+            withJSONObject: ["version": 1, "executables": entries],
+            options: [.sortedKeys]
+        )
+        let manifest = root.appendingPathComponent("NestedCode.json")
+        try manifestData.write(to: manifest)
+        let fakeBin = try makeFakeSwiftBin(at: root)
+
+        let result = try runBuilder(
+            buildDirectory: root.appendingPathComponent("build", isDirectory: true),
+            version: "0.2.0-dev",
+            buildNumber: "2",
+            manifest: manifest,
+            environment: ["PATH": "\(fakeBin.path):/usr/bin:/bin"]
+        )
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.contains("manifest fields must not contain control characters"), result.output)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: externalDirectory.appendingPathComponent("tab-escaped-product").path),
+            result.output
+        )
+    }
+
+    func testBuilderRejectsSymlinkedStagingDestinationBeforeWritingOutsideApp() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SymlinkDestinationBuilder-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let externalDirectory = root.appendingPathComponent("external", isDirectory: true)
+        try FileManager.default.createDirectory(at: externalDirectory, withIntermediateDirectories: true)
+        let resourceLink = repositoryRoot.appendingPathComponent("Packaging/LumiSync/Resources/staging-escape")
+        try? FileManager.default.removeItem(at: resourceLink)
+        try FileManager.default.createSymbolicLink(at: resourceLink, withDestinationURL: externalDirectory)
+        defer { try? FileManager.default.removeItem(at: resourceLink) }
+
+        let manifest = root.appendingPathComponent("NestedCode.json")
+        let escapedPath = "Contents/Resources/staging-escape/escaped-product"
+        try manifestJSON(entries: validEntries + [
+            ManifestEntry(path: escapedPath, product: "LumiSyncApp", role: "bundle")
+        ]).write(to: manifest, atomically: true, encoding: .utf8)
+        let fakeBin = try makeFakeSwiftBin(at: root)
+
+        let result = try runBuilder(
+            buildDirectory: root.appendingPathComponent("build", isDirectory: true),
+            version: "0.2.0-dev",
+            buildNumber: "2",
+            manifest: manifest,
+            environment: ["PATH": "\(fakeBin.path):/usr/bin:/bin"]
+        )
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.contains("staging destination contains a symlink"), result.output)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: externalDirectory.appendingPathComponent("escaped-product").path),
+            result.output
+        )
+    }
+
     func testBuilderRejectsTraversalDestinationBeforeWritingOutsideStaging() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("TraversalDestinationBuilder-\(UUID().uuidString)", isDirectory: true)
@@ -529,11 +640,37 @@ final class ReleaseBundleFixtureTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
     }
 
+    private func makeFakeSwiftBin(at root: URL) throws -> URL {
+        let fakeBin = root.appendingPathComponent("bin", isDirectory: true)
+        let products = root.appendingPathComponent("products", isDirectory: true)
+        try FileManager.default.createDirectory(at: fakeBin, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: products, withIntermediateDirectories: true)
+        for product in [
+            "LumiSyncApp",
+            "lumisync-backlight-controller",
+            "lumisync-backlight-supervisor",
+            "lumisync-backlight-writer"
+        ] {
+            try writeExecutable(at: products.appendingPathComponent(product))
+        }
+        try FileManager.default.createDirectory(
+            at: products.appendingPathComponent("LumiSync_LumiSyncAppSupport.bundle/en.lproj", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let fakeSwift = fakeBin.appendingPathComponent("swift")
+        try "#!/bin/sh\ncase \" $* \" in\n  *\" --show-bin-path \"*) printf '%s\\n' \"\(products.path)\" ;;\n  *) exit 0 ;;\nesac\n".write(
+            to: fakeSwift, atomically: true, encoding: .utf8
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeSwift.path)
+        return fakeBin
+    }
+
     private func runBuilder(
         buildDirectory: URL,
         version: String,
         buildNumber: String,
-        manifest: URL? = nil
+        manifest: URL? = nil,
+        environment: [String: String] = [:]
     ) throws -> (status: Int32, output: String) {
         let process = Process()
         let output = Pipe()
@@ -541,12 +678,15 @@ final class ReleaseBundleFixtureTests: XCTestCase {
         process.arguments = [
             repositoryRoot.appendingPathComponent("Scripts/build-unsigned-release-app.sh").path
         ]
-        process.environment = ProcessInfo.processInfo.environment.merging([
+        let overrides = [
             "BUILD_DIR": buildDirectory.path,
             "VERSION": version,
             "BUILD_NUMBER": buildNumber,
             "CONFIGURATION": "release"
-        ].merging(manifest.map { ["NESTED_CODE_MANIFEST": $0.path] } ?? [:]) { _, override in override }) { _, override in override }
+        ]
+            .merging(manifest.map { ["NESTED_CODE_MANIFEST": $0.path] } ?? [:]) { _, override in override }
+            .merging(environment) { _, override in override }
+        process.environment = ProcessInfo.processInfo.environment.merging(overrides) { _, override in override }
         process.standardOutput = output
         process.standardError = output
         try process.run()

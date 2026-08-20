@@ -20,6 +20,7 @@ REQUIRED_EXECUTABLES = {
     "supervisor": ("Contents/Helpers/lumisync-backlight-supervisor", "lumisync-backlight-supervisor"),
     "writer": ("Contents/Helpers/lumisync-backlight-writer", "lumisync-backlight-writer"),
 }
+ALLOWED_EXECUTABLE_ROLES = {*REQUIRED_EXECUTABLES, "framework", "appex", "xpc", "bundle"}
 MOCK_ARCH_PREFIX = "MOCK_MACHO_ARCH="
 MOCK_DEPENDENCY_PREFIX = "MOCK_DEPENDENCY="
 MOCK_RPATH_PREFIX = "MOCK_RPATH="
@@ -51,6 +52,8 @@ def load_manifest(path: Path) -> list[dict[str, str]]:
             raise ManifestError("each executable must contain only path, product, and role")
         if not all(isinstance(entry[key], str) and entry[key] for key in entry):
             raise ManifestError("executable path, product, and role must be nonempty strings")
+        if any(any(ord(character) < 0x20 or ord(character) == 0x7F for character in entry[key]) for key in entry):
+            raise ManifestError("manifest fields must not contain control characters")
 
         path_value = entry["path"]
         manifest_path = PurePosixPath(path_value)
@@ -62,6 +65,8 @@ def load_manifest(path: Path) -> list[dict[str, str]]:
             raise ManifestError(f"executable path must use canonical relative syntax: {path_value}")
         if path_value in paths:
             raise ManifestError(f"duplicate executable path: {path_value}")
+        if entry["role"] not in ALLOWED_EXECUTABLE_ROLES:
+            raise ManifestError(f"unknown executable role: {entry['role']}")
         if entry["role"] in roles:
             raise ManifestError(f"duplicate executable role: {entry['role']}")
         if len(manifest_path.parts) < 3 or manifest_path.parts[0] != "Contents":

@@ -52,13 +52,20 @@ for entry in entries:
 PY
 }
 
+manifest_entries_file="$(mktemp "${TMPDIR:-/tmp}/lumisync-manifest.XXXXXX")"
+cleanup_manifest_entries() {
+  rm -f -- "$manifest_entries_file"
+}
+trap cleanup_manifest_entries EXIT
+read_manifest_entries >"$manifest_entries_file"
+
 while IFS=$'\t' read -r product destination role; do
   swift build \
     --package-path "$REPO_ROOT" \
     --scratch-path "$SWIFTPM_BUILD_DIR" \
     --configuration "$CONFIGURATION" \
     --product "$product"
-done < <(read_manifest_entries)
+done <"$manifest_entries_file"
 
 bin_path="$(swift build \
   --package-path "$REPO_ROOT" \
@@ -70,12 +77,38 @@ stage_root="$(mktemp -d "${TMPDIR:-/tmp}/lumisync-unsigned.XXXXXX")"
 staged_app="$stage_root/$APP_NAME.app"
 cleanup() {
   rm -rf -- "$stage_root"
+  cleanup_manifest_entries
 }
 trap cleanup EXIT
 
 mkdir -p "$staged_app/Contents/MacOS" "$staged_app/Contents/Helpers" "$staged_app/Contents/Resources"
 cp "$INFO_PLIST_SOURCE" "$staged_app/Contents/Info.plist"
 cp -R "$RESOURCES_SOURCE/." "$staged_app/Contents/Resources/"
+
+assert_staging_destination_contained() {
+  local destination="$1"
+  python3 - "$staged_app" "$destination" <<'PY'
+import os
+import sys
+from pathlib import Path, PurePosixPath
+
+staging_root = Path(sys.argv[1]).resolve(strict=True)
+destination = PurePosixPath(sys.argv[2])
+current = staging_root
+for component in destination.parts[:-1]:
+    current /= component
+    if current.is_symlink():
+        raise SystemExit(f"staging destination contains a symlink: {destination}")
+    if current.exists() and not current.is_dir():
+        raise SystemExit(f"staging destination parent is not a directory: {destination}")
+
+resolved_parent = Path(os.path.realpath(current))
+try:
+    resolved_parent.relative_to(staging_root)
+except ValueError:
+    raise SystemExit(f"staging destination escapes staging root: {destination}")
+PY
+}
 
 copy_product() {
   local product="$1"
@@ -85,6 +118,7 @@ copy_product() {
     echo "SwiftPM product is missing or not executable: $source" >&2
     exit 1
   fi
+  assert_staging_destination_contained "$destination"
   mkdir -p "$(dirname "$staged_app/$destination")"
   cp "$source" "$staged_app/$destination"
   chmod 755 "$staged_app/$destination"
@@ -92,7 +126,7 @@ copy_product() {
 
 while IFS=$'\t' read -r product destination role; do
   copy_product "$product" "$destination"
-done < <(read_manifest_entries)
+done <"$manifest_entries_file"
 
 resource_bundle="$bin_path/LumiSync_LumiSyncAppSupport.bundle"
 if [[ ! -d "$resource_bundle" ]]; then
