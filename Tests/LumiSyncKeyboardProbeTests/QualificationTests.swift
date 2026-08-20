@@ -111,6 +111,20 @@ final class QualificationTests: XCTestCase {
             "encoding:setBrightness:forKeyboard:"
         ])
     }
+
+    func testQualificationAcceptsRuntimeOffsetsAfterCanonicalizingABI() {
+        let runtime = fixture(selectorSignatures: [
+            ObjectiveCSelectorSignature(name: "copyKeyboardBacklightIDs", typeEncoding: "@16@0:8"),
+            ObjectiveCSelectorSignature(name: "isKeyboardBuiltIn:", typeEncoding: "B24@0:8Q16"),
+            ObjectiveCSelectorSignature(name: "brightnessForKeyboard:", typeEncoding: "f24@0:8Q16"),
+            ObjectiveCSelectorSignature(name: "setBrightness:forKeyboard:", typeEncoding: "B28@0:8f16Q20")
+        ])
+
+        XCTAssertEqual(
+            BacklightQualificationPolicy().evaluate(saved: runtime, current: runtime),
+            .qualified(runtime)
+        )
+    }
 }
 
 private extension QualificationTests {

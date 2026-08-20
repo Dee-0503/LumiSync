@@ -84,7 +84,19 @@ public struct BacklightQualificationPolicy: Sendable {
         else {
             return false
         }
-        return identity.selectorSignatures == Self.requiredSelectorSignatures
+        return canonicalSignatures(identity.selectorSignatures)
+            == canonicalSignatures(Self.requiredSelectorSignatures)
+    }
+
+    private func canonicalSignatures(
+        _ signatures: [ObjectiveCSelectorSignature]
+    ) -> [ObjectiveCSelectorSignature] {
+        signatures.map {
+            ObjectiveCSelectorSignature(
+                name: $0.name,
+                typeEncoding: String($0.typeEncoding.filter { !$0.isNumber })
+            )
+        }
     }
 }
 
