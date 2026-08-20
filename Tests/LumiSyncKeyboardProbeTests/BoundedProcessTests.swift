@@ -163,6 +163,45 @@ final class BoundedProcessTests: XCTestCase {
         XCTAssertLessThan(started.duration(to: .now), .seconds(1))
     }
 
+    func testRunnerFailsClosedBeforeSpawnWhenSIGCHLDIsIgnored() async {
+        let previousCHLD = Darwin.signal(SIGCHLD, SIG_IGN)
+        defer { _ = Darwin.signal(SIGCHLD, previousCHLD) }
+        let pidFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lumisync-sigchld-\(UUID().uuidString).pid")
+        defer { try? FileManager.default.removeItem(at: pidFile) }
+
+        let result = await runner.run(
+            fixture(
+                command: "printf '%s' $$ > \(pidFile.path)",
+                timeout: .seconds(1)
+            )
+        )
+
+        XCTAssertEqual(
+            result.termination,
+            .failed("SIGCHLD disposition prevents owned child reaping")
+        )
+        XCTAssertNil(result.exitStatus)
+        XCTAssertNil(result.rootPID)
+        XCTAssertFalse(result.cleanupVerified)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: pidFile.path))
+    }
+
+    func testRunnerLeavesIgnoredSIGCHLDDispositionUnchanged() async {
+        let previousCHLD = Darwin.signal(SIGCHLD, SIG_IGN)
+        defer { _ = Darwin.signal(SIGCHLD, previousCHLD) }
+
+        _ = await runner.run(
+            fixture(command: "exit 0", timeout: .seconds(1))
+        )
+
+        let unchangedCHLD = Darwin.signal(SIGCHLD, SIG_IGN)
+        XCTAssertEqual(
+            unsafeBitCast(unchangedCHLD, to: UnsafeRawPointer?.self),
+            unsafeBitCast(SIG_IGN, to: UnsafeRawPointer?.self)
+        )
+    }
+
     func testRunnerResetsInheritedIgnoredTerminationSignals() async {
         let previousINT = Darwin.signal(SIGINT, SIG_IGN)
         let previousTERM = Darwin.signal(SIGTERM, SIG_IGN)

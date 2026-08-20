@@ -182,6 +182,7 @@ public actor BoundedOwnedProcessRunner: OwnedProcessRunning {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: request.timeout)
         do {
+            try ensureChildrenAreReapable()
             let process = try SpawnedProcess(request: request)
             var waitStatus: Int32 = 0
             do {
@@ -319,8 +320,24 @@ public actor BoundedOwnedProcessRunner: OwnedProcessRunning {
                 stdout: Data(),
                 stderr: Data(),
                 rootPID: nil,
-                cleanupVerified: true
+                cleanupVerified: !(error is ChildReapingUnavailable)
             )
+        }
+    }
+
+    private func ensureChildrenAreReapable() throws {
+        var action = sigaction()
+        guard sigaction(SIGCHLD, nil, &action) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        let handler = unsafeBitCast(
+            action.__sigaction_u.__sa_handler,
+            to: UnsafeRawPointer?.self
+        )
+        let ignoredHandler = unsafeBitCast(SIG_IGN, to: UnsafeRawPointer?.self)
+        guard handler != ignoredHandler,
+              action.sa_flags & SA_NOCLDWAIT == 0 else {
+            throw ChildReapingUnavailable()
         }
     }
 
@@ -395,6 +412,11 @@ private struct OutputCollection {
 
 private struct StandardInputWriteTimeout: Error {}
 private struct StandardInputWriteCancellation: Error {}
+private struct ChildReapingUnavailable: Error, CustomStringConvertible {
+    var description: String {
+        "SIGCHLD disposition prevents owned child reaping"
+    }
+}
 
 private enum SpawnedProcessError: Error, CustomStringConvertible {
     case spawn(Int32)
