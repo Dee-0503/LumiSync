@@ -5,8 +5,11 @@ import XCTest
 
 struct ProcessResult {
     let termination: OwnedProcessTermination
+    let exitStatus: Int32?
     let stdout: Data
     let stderr: Data
+    let rootPID: Int32?
+    let cleanupVerified: Bool
 }
 
 enum OwnedScenarioRole {
@@ -22,7 +25,8 @@ final class ProcessHarness {
 
     init(
         initialValue: Double = 0.37,
-        pausedAt stage: BacklightStage? = nil
+        pausedAt stage: BacklightStage? = nil,
+        faultActions: [FakeBacklightFaultAction] = []
     ) throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("LumiSyncProcessTest-\(UUID().uuidString)", isDirectory: true)
@@ -34,7 +38,8 @@ final class ProcessHarness {
         try FileBackedFakeBacklightDevice.create(
             directory: directory,
             configuration: FakeBacklightDeviceConfiguration(
-                initialValue: try NormalizedBacklightValue(initialValue)
+                initialValue: try NormalizedBacklightValue(initialValue),
+                faultActions: faultActions
             )
         )
         if let stage {
@@ -53,9 +58,21 @@ final class ProcessHarness {
     }
 
     func run(input: Data, timeout: Duration) async -> ProcessResult {
+        await run(executableURL: controllerURL, input: input, timeout: timeout)
+    }
+
+    func runWriter(input: Data, timeout: Duration) async -> ProcessResult {
+        await run(executableURL: writerURL, input: input, timeout: timeout)
+    }
+
+    private func run(
+        executableURL: URL,
+        input: Data,
+        timeout: Duration
+    ) async -> ProcessResult {
         let result = await BoundedOwnedProcessRunner().run(
             OwnedProcessRequest(
-                executableURL: controllerURL,
+                executableURL: executableURL,
                 standardInput: input,
                 timeout: timeout,
                 environment: environment
@@ -63,8 +80,11 @@ final class ProcessHarness {
         )
         return ProcessResult(
             termination: result.termination,
+            exitStatus: result.exitStatus,
             stdout: result.stdout,
-            stderr: result.stderr
+            stderr: result.stderr,
+            rootPID: result.rootPID,
+            cleanupVerified: result.cleanupVerified
         )
     }
 
@@ -246,8 +266,11 @@ final class ProcessScenario {
         }
         return ProcessResult(
             termination: termination,
+            exitStatus: process.terminationReason == .exit ? process.terminationStatus : nil,
             stdout: stdoutPipe.fileHandleForReading.readDataToEndOfFile(),
-            stderr: stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            stderr: stderrPipe.fileHandleForReading.readDataToEndOfFile(),
+            rootPID: process.processIdentifier,
+            cleanupVerified: ownedProcesses.values.allSatisfy(Self.processIsGoneOrReused)
         )
     }
 

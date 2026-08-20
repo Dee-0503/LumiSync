@@ -35,15 +35,138 @@ final class ThreeProcessRecoveryTests: XCTestCase {
         )
     }
 
-    func testMalformedInputIsRejectedWithoutMutation() async throws {
-        let harness = try ProcessHarness()
-        let result = await harness.run(input: Data(), timeout: .seconds(2))
-        XCTAssertEqual(result.termination, .exited)
-        XCTAssertEqual(
-            try FramedJSONCodec().decode(BacklightOperationResult.self, from: result.stdout),
-            .failure(primary: .protocolViolation, restoration: .notRequired)
+    func testMalformedProtocolIsRejectedWithoutLeakingProcesses() async throws {
+        let validHarness = try ProcessHarness()
+        let request = try validHarness.makeRequest(
+            requestID: "malformed-matrix",
+            operation: .set(try NormalizedBacklightValue(0.5))
         )
-        XCTAssertEqual(try harness.currentValue(), try NormalizedBacklightValue(0.37))
+        let validFrame = try FramedJSONCodec().encode(request)
+        let validPayload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(validFrame.dropFirst(4))) as? [String: Any]
+        )
+        var unknownVersion = validPayload
+        unknownVersion["version"] = BacklightRequest.currentVersion + 1
+
+        let malformedInputs: [(String, Data)] = [
+            ("empty", Data()),
+            ("truncated-header", Data([0, 0, 0])),
+            ("oversized-frame", Data([0, 0, 0x40, 0x01])),
+            ("truncated-json", framed(Data("{".utf8))),
+            ("unknown-version", try framedJSON(unknownVersion)),
+            ("trailing-bytes", validFrame + Data([0])),
+            ("two-frames", validFrame + validFrame),
+            ("unknown-operation", try framedJSON(validPayload.merging([
+                "operation": ["unknown": [:]]
+            ]) { _, new in new })),
+            ("non-finite-brightness", framed(Data(
+                "{\"version\":1,\"requestID\":{\"rawValue\":\"non-finite\"},\"operation\":{\"set\":{\"_0\":{\"rawValue\":1e999}}},\"deadline\":{\"remainingNanoseconds\":2000000000}}".utf8
+            )))
+        ]
+
+        for (name, input) in malformedInputs {
+            let harness = try ProcessHarness()
+            let result = await harness.run(input: input, timeout: .seconds(2))
+            XCTAssertEqual(result.termination, .exited, name)
+            XCTAssertEqual(result.exitStatus, EX_OK, name)
+            XCTAssertTrue(result.cleanupVerified, name)
+            XCTAssertLessThanOrEqual(result.stdout.count, 64 * 1024, name)
+            XCTAssertLessThanOrEqual(result.stderr.count, 64 * 1024, name)
+            XCTAssertTrue(result.stderr.isEmpty, name)
+            XCTAssertEqual(
+                try FramedJSONCodec().decode(BacklightOperationResult.self, from: result.stdout),
+                .failure(primary: .protocolViolation, restoration: .notRequired),
+                name
+            )
+            XCTAssertEqual(try harness.currentValue(), try NormalizedBacklightValue(0.37), name)
+            XCTAssertTrue(try harness.journalEntries().filter { $0.processRole == .writer }.isEmpty, name)
+        }
+
+        let extraOutputHarness = try ProcessHarness(faultActions: [.malformedOutput])
+        let extraOutputRequest = try extraOutputHarness.makeRequest(
+            requestID: "extra-writer-stdout",
+            operation: .read
+        )
+        let writerResult = await extraOutputHarness.runWriter(
+            input: try FramedJSONCodec().encode(extraOutputRequest),
+            timeout: .seconds(2)
+        )
+        XCTAssertEqual(writerResult.termination, .exited)
+        XCTAssertEqual(writerResult.exitStatus, EX_OK)
+        XCTAssertTrue(writerResult.cleanupVerified)
+        XCTAssertLessThanOrEqual(writerResult.stdout.count, 64 * 1024)
+        XCTAssertLessThanOrEqual(writerResult.stderr.count, 64 * 1024)
+        XCTAssertTrue(writerResult.stderr.isEmpty)
+        XCTAssertThrowsError(
+            try FramedJSONCodec().decode(BacklightOperationResult.self, from: writerResult.stdout)
+        ) { error in
+            XCTAssertEqual(error as? FramedJSONError, .trailingBytes)
+        }
+        XCTAssertEqual(try extraOutputHarness.currentValue(), try NormalizedBacklightValue(0.37))
+        XCTAssertTrue(try extraOutputHarness.journalEntries().filter { $0.processRole == .writer }.isEmpty)
+    }
+
+    private func framed(_ payload: Data) -> Data {
+        let length = UInt32(payload.count)
+        return Data([
+            UInt8((length >> 24) & 0xff),
+            UInt8((length >> 16) & 0xff),
+            UInt8((length >> 8) & 0xff),
+            UInt8(length & 0xff)
+        ]) + payload
+    }
+
+    private func framedJSON(_ object: Any) throws -> Data {
+        framed(try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]))
+    }
+
+    func testProcessEscapeAttemptsAreContainedAfterWriterRootExits() async throws {
+        for (name, fault) in [
+            ("forked-child", FakeBacklightFaultAction.forkSleepingChild),
+            ("setsid-child", FakeBacklightFaultAction.attemptSetsid)
+        ] {
+            let harness = try ProcessHarness(faultActions: [fault])
+            let request = try harness.makeRequest(
+                requestID: "escape-\(name)",
+                operation: .read
+            )
+            let started = ContinuousClock.now
+            let result = await harness.runWriter(
+                input: try FramedJSONCodec().encode(request),
+                timeout: .seconds(4)
+            )
+
+            XCTAssertLessThan(started.duration(to: .now), .seconds(5), name)
+            XCTAssertEqual(result.termination, .exited, name)
+            XCTAssertEqual(result.exitStatus, EX_OK, name)
+            XCTAssertTrue(result.cleanupVerified, name)
+            XCTAssertTrue(result.stderr.isEmpty, name)
+            XCTAssertEqual(
+                try FramedJSONCodec().decode(BacklightOperationResult.self, from: result.stdout),
+                .failure(primary: .protocolViolation, restoration: .notRequired),
+                name
+            )
+            let descendantEntries = try harness.journalEntries().filter {
+                $0.requestID == request.requestID && $0.processRole == .writer
+            }
+            let descendantPID = try XCTUnwrap(descendantEntries.last?.processID, name)
+            XCTAssertNotEqual(descendantPID, result.rootPID, name)
+            XCTAssertTrue(processIsGoneOrZombie(descendantPID), "\(name): PID \(descendantPID) survived")
+            XCTAssertEqual(try harness.currentValue(), try NormalizedBacklightValue(0.37), name)
+        }
+    }
+
+    private func processIsGoneOrZombie(_ pid: pid_t) -> Bool {
+        if kill(pid, 0) == -1 { return errno == ESRCH }
+        var info = proc_bsdinfo()
+        let size = proc_pidinfo(
+            pid,
+            PROC_PIDTBSDINFO,
+            0,
+            &info,
+            Int32(MemoryLayout<proc_bsdinfo>.size)
+        )
+        return size <= 0 || info.pbi_status == UInt32(SZOMB)
     }
 
     func testStageTimeoutMatrixIsContainedAndReportsRestorationCertainty() throws {

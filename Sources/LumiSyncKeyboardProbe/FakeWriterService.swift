@@ -1,6 +1,9 @@
 import Darwin
 import Foundation
 
+@_silgen_name("fork")
+private func rawFork() -> pid_t
+
 public struct FakeWriterService {
     public init() {}
 
@@ -17,27 +20,35 @@ public struct FakeWriterService {
             switch request.operation {
             case .read:
                 if let result = try handleFault(
-                    device.consumeFault(for: .captureOriginal)
+                    device.consumeFault(for: .captureOriginal),
+                    device: device,
+                    requestID: request.requestID
                 ) {
                     return result
                 }
                 return .success(readback: try device.read(requestID: request.requestID))
             case .set(let value):
                 if let result = try handleFault(
-                    device.consumeFault(for: .write)
+                    device.consumeFault(for: .write),
+                    device: device,
+                    requestID: request.requestID
                 ) {
                     return result
                 }
                 try device.write(value, requestID: request.requestID)
                 if let result = try handleFault(
-                    device.consumeFault(for: .writeReadback)
+                    device.consumeFault(for: .writeReadback),
+                    device: device,
+                    requestID: request.requestID
                 ) {
                     return result
                 }
                 return .success(readback: try device.read(requestID: request.requestID))
             case .restore(let value):
                 if let result = try handleFault(
-                    device.consumeFault(for: .restore)
+                    device.consumeFault(for: .restore),
+                    device: device,
+                    requestID: request.requestID
                 ) {
                     return result
                 }
@@ -47,7 +58,9 @@ public struct FakeWriterService {
                     operationCategory: .restore
                 )
                 if let result = try handleFault(
-                    device.consumeFault(for: .restoreReadback)
+                    device.consumeFault(for: .restoreReadback),
+                    device: device,
+                    requestID: request.requestID
                 ) {
                     return result
                 }
@@ -62,7 +75,9 @@ public struct FakeWriterService {
     }
 
     private func handleFault(
-        _ fault: FakeBacklightFaultAction?
+        _ fault: FakeBacklightFaultAction?,
+        device: FileBackedFakeBacklightDevice,
+        requestID: BacklightRequestID
     ) throws -> BacklightOperationResult? {
         guard let fault else { return nil }
         switch fault {
@@ -80,8 +95,45 @@ public struct FakeWriterService {
             while true {
                 _ = Darwin.pause()
             }
-        case .malformedOutput, .forkSleepingChild, .attemptSetsid:
+        case .malformedOutput:
+            try FileHandle.standardOutput.write(contentsOf: Data([0]))
             return .failure(primary: .protocolViolation, restoration: .notRequired)
+        case .forkSleepingChild:
+            try spawnEscapingChild(device: device, requestID: requestID, createSession: false)
+            return .failure(primary: .protocolViolation, restoration: .notRequired)
+        case .attemptSetsid:
+            try spawnEscapingChild(device: device, requestID: requestID, createSession: true)
+            return .failure(primary: .protocolViolation, restoration: .notRequired)
+        }
+    }
+
+    private func spawnEscapingChild(
+        device: FileBackedFakeBacklightDevice,
+        requestID: BacklightRequestID,
+        createSession: Bool
+    ) throws {
+        let childPID = rawFork()
+        guard childPID >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        guard childPID == 0 else {
+            _ = Darwin.raise(SIGSTOP)
+            return
+        }
+        if createSession {
+            _ = setsid()
+        }
+        _ = Darwin.close(STDIN_FILENO)
+        _ = Darwin.close(STDOUT_FILENO)
+        _ = Darwin.close(STDERR_FILENO)
+        let marker = try! NormalizedBacklightValue(0.37)
+        try? device.write(
+            marker,
+            requestID: requestID,
+            operationCategory: .restore
+        )
+        while true {
+            _ = Darwin.pause()
         }
     }
 }

@@ -76,10 +76,17 @@ public actor BoundedOwnedProcessRunner: OwnedProcessRunning {
             var didReap = false
 
             while true {
-                let result = waitpid(process.pid, &waitStatus, WNOHANG)
+                let result = waitpid(process.pid, &waitStatus, WNOHANG | WUNTRACED)
                 if result == process.pid {
+                    if Self.isStopped(waitStatus) {
+                        process.refreshDescendants()
+                        _ = kill(process.pid, SIGCONT)
+                        continue
+                    }
                     didReap = true
                     termination = Self.termination(for: waitStatus)
+                    process.refreshDescendants()
+                    process.terminateKnownDescendants()
                     break
                 }
                 if result == -1 {
@@ -147,6 +154,10 @@ public actor BoundedOwnedProcessRunner: OwnedProcessRunning {
         return .signaled(status & 0x7f)
     }
 
+    private static func isStopped(_ status: Int32) -> Bool {
+        status & 0x7f == 0x7f && (status >> 8) & 0xff != SIGCONT
+    }
+
     private static func exitStatus(for status: Int32) -> Int32 {
         (status >> 8) & 0xff
     }
@@ -212,6 +223,15 @@ private final class SpawnedProcess: @unchecked Sendable {
         posix_spawn_file_actions_addclose(&actions, inputPipe[1])
         posix_spawn_file_actions_addclose(&actions, outputPipe[0])
         posix_spawn_file_actions_addclose(&actions, errorPipe[0])
+        if inputPipe[0] != STDIN_FILENO {
+            posix_spawn_file_actions_addclose(&actions, inputPipe[0])
+        }
+        if outputPipe[1] != STDOUT_FILENO {
+            posix_spawn_file_actions_addclose(&actions, outputPipe[1])
+        }
+        if errorPipe[1] != STDERR_FILENO {
+            posix_spawn_file_actions_addclose(&actions, errorPipe[1])
+        }
 
         var attributes: posix_spawnattr_t?
         posix_spawnattr_init(&attributes)
@@ -350,7 +370,7 @@ private final class SpawnedProcess: @unchecked Sendable {
                 proc_listchildpids(parent, $0.baseAddress, Int32($0.count * MemoryLayout<pid_t>.size))
             }
             guard count > 0 else { continue }
-            let childCount = Int(count) / MemoryLayout<pid_t>.size
+            let childCount = Int(count)
             for child in buffer.prefix(childCount) where child > 0 && discovered.insert(child).inserted {
                 frontier.append(child)
             }
