@@ -145,6 +145,29 @@ final class QualificationTests: XCTestCase {
         }
     }
 
+    func testQualificationRejectsMixedOrPartiallyFramedABIEncodings() {
+        let unsupportedEncodings = [
+            "B28@:fQ",
+            "B28@0:8f16Q",
+            "B@:f16Q20",
+            "B28@0:8fQ20",
+            "B28@0:8f16Q20 ",
+            "B28@0:8f16Q20v",
+            "B28@0::8f16Q20"
+        ]
+
+        for encoding in unsupportedEncodings {
+            XCTAssertEqual(
+                BacklightQualificationPolicy().evaluate(
+                    saved: fixture(),
+                    current: fixture(setterEncoding: encoding)
+                ),
+                .unqualified(reason: "Current CoreBrightness selector set or ABI is unsupported."),
+                encoding
+            )
+        }
+    }
+
     func testQualificationFailsClosedForMalformedOrUnsupportedABIEncodings() {
         let malformedEncodings = [
             "B28@0:8f16[16Q",

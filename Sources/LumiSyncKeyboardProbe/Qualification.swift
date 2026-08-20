@@ -100,6 +100,10 @@ public struct BacklightQualificationPolicy: Sendable {
     }
 
     private func typeEncoding(_ actual: String, matches required: String) -> Bool {
+        if actual == required {
+            return true
+        }
+
         let actualBytes = Array(actual.utf8)
         let requiredBytes = Array(required.utf8)
         guard actualBytes.allSatisfy({ $0 < 0x80 }) else {
@@ -114,9 +118,14 @@ public struct BacklightQualificationPolicy: Sendable {
                 return false
             }
             actualIndex += 1
+
+            let offsetStart = actualIndex
             while actualIndex < actualBytes.count,
                   isASCIIDigit(actualBytes[actualIndex]) {
                 actualIndex += 1
+            }
+            guard actualIndex > offsetStart else {
+                return false
             }
         }
         return actualIndex == actualBytes.count
