@@ -89,6 +89,41 @@ final class ReleaseBundleFixtureTests: XCTestCase {
         )
     }
 
+    func testRejectsAbsoluteIconFilePath() throws {
+        let fixture = try makeValidFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let externalIcon = fixture.root.appendingPathComponent("External.icns")
+        try Data().write(to: externalIcon)
+        try updateInfoPlist(at: fixture.app) { plist in
+            plist["CFBundleIconFile"] = externalIcon.path
+        }
+
+        let result = try runVerifier(app: fixture.app, manifest: fixture.manifest)
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.contains("CFBundleIconFile must be a relative resource name"), result.output)
+    }
+
+    func testRejectsIconSymlinkThatEscapesResources() throws {
+        let fixture = try makeValidFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let externalIcon = fixture.root.appendingPathComponent("External.icns")
+        try Data().write(to: externalIcon)
+        let icon = fixture.app.appendingPathComponent("Contents/Resources/LumiSync.icns")
+        try FileManager.default.removeItem(at: icon)
+        try FileManager.default.createSymbolicLink(at: icon, withDestinationURL: externalIcon)
+
+        let result = try runVerifier(app: fixture.app, manifest: fixture.manifest)
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(
+            result.output.contains("icon resource must be a regular non-symlink file: Contents/Resources/LumiSync.icns"),
+            result.output
+        )
+    }
+
     func testRejectsUnexpectedNonExecutableFileInCodeDirectories() throws {
         let fixture = try makeValidFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -393,6 +428,7 @@ final class ReleaseBundleFixtureTests: XCTestCase {
         let plist: [String: Any] = [
             "CFBundleShortVersionString": "1.2.3",
             "CFBundleVersion": "42",
+            "CFBundleExecutable": "LumiSync",
             "CFBundleIconFile": "LumiSync.icns"
         ]
         let plistData = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
@@ -435,6 +471,7 @@ final class ReleaseBundleFixtureTests: XCTestCase {
         let plist: [String: Any] = [
             "CFBundleShortVersionString": "9.9.9",
             "CFBundleVersion": "42",
+            "CFBundleExecutable": "LumiSync",
             "CFBundleIconFile": "LumiSync.icns"
         ]
         let plistData = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)

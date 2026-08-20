@@ -317,9 +317,20 @@ def validate_bundle(
     if not isinstance(icon_name, str) or not icon_name:
         errors.append("CFBundleIconFile must name an icon resource")
     else:
-        icon_file = icon_name if Path(icon_name).suffix else f"{icon_name}.icns"
-        if not (app / "Contents/Resources" / icon_file).is_file():
-            errors.append(f"missing icon resource: Contents/Resources/{icon_file}")
+        icon_path = PurePosixPath(icon_name)
+        if icon_path.is_absolute() or ".." in icon_path.parts or "\\" in icon_name or icon_path.as_posix() != icon_name:
+            errors.append("CFBundleIconFile must be a relative resource name")
+        else:
+            icon_file = icon_name if icon_path.suffix else f"{icon_name}.icns"
+            icon_relative = f"Contents/Resources/{icon_file}"
+            icon_resource = app / icon_relative
+            try:
+                icon_mode = icon_resource.lstat().st_mode
+            except OSError:
+                errors.append(f"missing icon resource: {icon_relative}")
+            else:
+                if not stat.S_ISREG(icon_mode) or stat.S_ISLNK(icon_mode) or first_symlink_component(app, icon_relative) is not None:
+                    errors.append(f"icon resource must be a regular non-symlink file: {icon_relative}")
 
     resources = app / "Contents/Resources"
     localization_bundles = list(resources.glob("*.bundle")) if resources.is_dir() else []
