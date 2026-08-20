@@ -125,6 +125,49 @@ final class QualificationTests: XCTestCase {
             .qualified(runtime)
         )
     }
+
+    func testQualificationRejectsDigitsThatBelongToABITypes() {
+        let incompatibleEncodings = [
+            "B28@0:8f16[16Q]20",
+            "B28@0:8f16b1",
+            "B28@0:8f16^{Pair=Q16}",
+            "B28@0:8f16{Pair=Q16}",
+            "B28@0:8f16(Pair=Q16)"
+        ]
+
+        for encoding in incompatibleEncodings {
+            let current = fixture(setterEncoding: encoding)
+            XCTAssertEqual(
+                BacklightQualificationPolicy().evaluate(saved: fixture(), current: current),
+                .unqualified(reason: "Current CoreBrightness selector set or ABI is unsupported."),
+                encoding
+            )
+        }
+    }
+
+    func testQualificationFailsClosedForMalformedOrUnsupportedABIEncodings() {
+        let malformedEncodings = [
+            "B28@0:8f16[16Q",
+            "B28@0:8f16{Pair=Q",
+            "B28@0:8f16(Pair=Q",
+            "B28@0:8f16^",
+            "B28@0:8f16?",
+            "B28@0:8f16@?20",
+            "B28@0:8f16rQ20",
+            "B²@³:⁴f⁵Q⁶"
+        ]
+
+        for encoding in malformedEncodings {
+            XCTAssertEqual(
+                BacklightQualificationPolicy().evaluate(
+                    saved: fixture(),
+                    current: fixture(setterEncoding: encoding)
+                ),
+                .unqualified(reason: "Current CoreBrightness selector set or ABI is unsupported."),
+                encoding
+            )
+        }
+    }
 }
 
 private extension QualificationTests {
