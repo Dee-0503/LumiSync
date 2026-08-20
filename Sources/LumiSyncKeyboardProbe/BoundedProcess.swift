@@ -575,8 +575,10 @@ private final class SpawnedProcess: @unchecked Sendable {
         groupID = spawnedPID
         descendantTracker = DescendantProcessTracker(operations: Self.descendantOperations)
         input = FileHandle(fileDescriptor: inputPipe[1], closeOnDealloc: true)
-        output = FileHandle(fileDescriptor: outputPipe[0], closeOnDealloc: true)
-        error = FileHandle(fileDescriptor: errorPipe[0], closeOnDealloc: true)
+        let output = FileHandle(fileDescriptor: outputPipe[0], closeOnDealloc: true)
+        let error = FileHandle(fileDescriptor: errorPipe[0], closeOnDealloc: true)
+        self.output = output
+        self.error = error
         output.readabilityHandler = { [weak self] handle in
             self?.consumeAvailableData(from: handle, isStdout: true)
         }
