@@ -33,6 +33,35 @@ final class FakeBacklightDeviceTests: XCTestCase {
         XCTAssertTrue(entries.allSatisfy { $0.processID == getpid() })
     }
 
+    func testReadRecoversDurablePrepareBeforeAppendingReadRecord() throws {
+        let directory = try makeTemporaryFakeDevice(initial: 0.37)
+        let failedDevice = try FileBackedFakeBacklightDevice(
+            directory: directory,
+            systemCalls: ScriptedFakeBacklightSystemCalls(
+                failures: [.fsync(.stateFile)]
+            )
+        )
+        let failedID = try BacklightRequestID(rawValue: "prepare-before-read")
+        XCTAssertThrowsError(
+            try failedDevice.write(
+                try NormalizedBacklightValue(0.5),
+                requestID: failedID
+            )
+        )
+
+        let readID = try BacklightRequestID(rawValue: "recovery-read")
+        let device = try FileBackedFakeBacklightDevice(directory: directory)
+        XCTAssertEqual(
+            try device.read(requestID: readID),
+            try NormalizedBacklightValue(0.37)
+        )
+
+        let records = try rawJournalRecords(in: directory)
+        XCTAssertEqual(records.map(\.phase), [.prepare, .abort, .commit])
+        XCTAssertEqual(records.map(\.sequenceNumber), [1, 1, 2])
+        XCTAssertEqual(try device.journalEntries().map(\.requestID), [readID])
+    }
+
     func testWriteLeavesStateAndJournalUnchangedWhenJournalAppendFails() throws {
         let directory = try makeTemporaryFakeDevice(initial: 0.37)
         let requestID = try BacklightRequestID(rawValue: "journal-full")
