@@ -32,24 +32,22 @@ if [[ "$CONFIGURATION" != "release" ]]; then
 fi
 
 read_manifest_entries() {
-  python3 - "$MANIFEST" <<'PY'
-import json
+  python3 - "$MANIFEST" "$VERIFIER" <<'PY'
+import importlib.util
 import sys
 
-manifest_path = sys.argv[1]
+manifest_path, verifier_path = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("release_bundle_verifier", verifier_path)
+if spec is None or spec.loader is None:
+    raise SystemExit(f"Cannot load release bundle verifier: {verifier_path}")
+verifier = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(verifier)
 try:
-    document = json.load(open(manifest_path, encoding="utf-8"))
-    entries = document["executables"]
-except (OSError, ValueError, KeyError, TypeError) as error:
-    raise SystemExit(f"Cannot read nested-code manifest {manifest_path}: {error}")
+    entries = verifier.load_manifest(verifier.Path(manifest_path))
+except verifier.ManifestError as error:
+    raise SystemExit(str(error))
 
-if not isinstance(entries, list) or not entries:
-    raise SystemExit(f"Nested-code manifest has no executable entries: {manifest_path}")
 for entry in entries:
-    if not isinstance(entry, dict) or set(entry) != {"path", "product", "role"}:
-        raise SystemExit(f"Nested-code manifest entry is invalid: {entry!r}")
-    if not all(isinstance(entry[key], str) and entry[key] for key in ("path", "product", "role")):
-        raise SystemExit(f"Nested-code manifest entry has an empty field: {entry!r}")
     print("\t".join((entry["product"], entry["path"], entry["role"])))
 PY
 }

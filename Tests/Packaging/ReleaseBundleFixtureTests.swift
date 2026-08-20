@@ -251,16 +251,59 @@ final class ReleaseBundleFixtureTests: XCTestCase {
         XCTAssertTrue(result.output.contains("undeclared Mach-O object: Contents/PlugIns/Lumi.appex/Contents/MacOS/LumiExtension"), result.output)
     }
 
-    func testBuilderStagesManifestDeclaredProductAtManifestPath() throws {
+    func testRejectsManifestThatOmitsRequiredHelpers() throws {
+        let manifest = manifestJSON(entries: [
+            ManifestEntry(path: "Contents/MacOS/LumiSync", product: "LumiSyncApp", role: "app")
+        ])
+        let fixture = try makeValidFixture(manifest: manifest)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let helpers = fixture.app.appendingPathComponent("Contents/Helpers", isDirectory: true)
+        for helper in [
+            "lumisync-backlight-controller",
+            "lumisync-backlight-supervisor",
+            "lumisync-backlight-writer"
+        ] {
+            try FileManager.default.removeItem(at: helpers.appendingPathComponent(helper))
+        }
+
+        let result = try runVerifier(app: fixture.app, manifest: fixture.manifest)
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.contains("missing required executable roles: controller, supervisor, writer"), result.output)
+    }
+
+    func testBuilderRejectsManifestThatOmitsRequiredHelpers() throws {
         let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ManifestDerivedBuilder-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("MissingRequiredBuilder-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let manifest = root.appendingPathComponent("NestedCode.json")
+        try manifestJSON(entries: [
+            ManifestEntry(path: "Contents/MacOS/LumiSync", product: "LumiSyncApp", role: "app")
+        ]).write(to: manifest, atomically: true, encoding: .utf8)
+
+        let result = try runBuilder(
+            buildDirectory: root.appendingPathComponent("build", isDirectory: true),
+            version: "0.2.0-dev",
+            buildNumber: "2",
+            manifest: manifest
+        )
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.contains("missing required executable roles: controller, supervisor, writer"), result.output)
+    }
+
+    func testBuilderRejectsNoncanonicalRequiredExecutablePath() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("NoncanonicalRequiredBuilder-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
         let manifest = root.appendingPathComponent("NestedCode.json")
         let relocatedController = "Contents/Helpers/Derived/lumisync-backlight-controller"
         let entries = validEntries.map { entry in
-            entry.path == "Contents/Helpers/lumisync-backlight-controller"
+            entry.role == "controller"
                 ? ManifestEntry(path: relocatedController, product: entry.product, role: entry.role)
                 : entry
         }
@@ -274,10 +317,13 @@ final class ReleaseBundleFixtureTests: XCTestCase {
             manifest: manifest
         )
 
-        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(
+            result.output.contains("required executable role controller must use path Contents/Helpers/lumisync-backlight-controller"),
+            result.output
+        )
         let app = buildDirectory.appendingPathComponent("unsigned-release/LumiSync.app", isDirectory: true)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: app.appendingPathComponent(relocatedController).path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: app.appendingPathComponent("Contents/Helpers/lumisync-backlight-controller").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: app.appendingPathComponent(relocatedController).path))
     }
 
     private var manifestScenarios: [(name: String, manifest: String, expectedError: String)] {

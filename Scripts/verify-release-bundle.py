@@ -14,6 +14,12 @@ from pathlib import Path, PurePosixPath
 FORBIDDEN_STRINGS = (".build", "/Users/", "/private/tmp/")
 CODE_ROOT_DIRECTORIES = ("Contents/MacOS", "Contents/Helpers", "Contents/Frameworks", "Contents/PlugIns", "Contents/XPCServices")
 BUNDLE_SUFFIXES = (".app", ".appex", ".xpc", ".framework", ".bundle")
+REQUIRED_EXECUTABLES = {
+    "app": ("Contents/MacOS/LumiSync", "LumiSyncApp"),
+    "controller": ("Contents/Helpers/lumisync-backlight-controller", "lumisync-backlight-controller"),
+    "supervisor": ("Contents/Helpers/lumisync-backlight-supervisor", "lumisync-backlight-supervisor"),
+    "writer": ("Contents/Helpers/lumisync-backlight-writer", "lumisync-backlight-writer"),
+}
 MOCK_ARCH_PREFIX = "MOCK_MACHO_ARCH="
 MOCK_DEPENDENCY_PREFIX = "MOCK_DEPENDENCY="
 MOCK_RPATH_PREFIX = "MOCK_RPATH="
@@ -64,6 +70,19 @@ def load_manifest(path: Path) -> list[dict[str, str]]:
         paths.add(path_value)
         roles.add(entry["role"])
         parsed.append(entry)
+
+    entries_by_role = {entry["role"]: entry for entry in parsed}
+    missing_roles = [role for role in REQUIRED_EXECUTABLES if role not in entries_by_role]
+    if missing_roles:
+        raise ManifestError(
+            "missing required executable roles: " + ", ".join(missing_roles)
+        )
+    for role, (required_path, required_product) in REQUIRED_EXECUTABLES.items():
+        entry = entries_by_role[role]
+        if entry["path"] != required_path:
+            raise ManifestError(f"required executable role {role} must use path {required_path}")
+        if entry["product"] != required_product:
+            raise ManifestError(f"required executable role {role} must use product {required_product}")
     return parsed
 
 
