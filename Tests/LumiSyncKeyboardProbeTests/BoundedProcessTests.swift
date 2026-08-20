@@ -85,6 +85,84 @@ final class BoundedProcessTests: XCTestCase {
         XCTAssertLessThan(elapsed, .seconds(1))
     }
 
+    func testCancellingRunnerTerminatesAndReapsOwnedProcess() async throws {
+        let pidFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lumisync-cancelled-\(UUID().uuidString).pid")
+        defer { try? FileManager.default.removeItem(at: pidFile) }
+        let request = fixture(
+            command: "printf '%s' $$ > \(pidFile.path); sleep 30",
+            timeout: .seconds(10)
+        )
+        let ownedRunner = BoundedOwnedProcessRunner()
+        let task = Task {
+            await ownedRunner.run(request)
+        }
+        let pid = try XCTUnwrap(waitForPID(in: pidFile))
+        let started = ContinuousClock.now
+
+        task.cancel()
+        let result = await task.value
+
+        XCTAssertEqual(result.termination, .failed("cancelled"))
+        XCTAssertNil(result.exitStatus)
+        XCTAssertTrue(result.cleanupVerified)
+        XCTAssertTrue(waitUntilGone(pid))
+        XCTAssertLessThan(started.duration(to: .now), .seconds(1))
+    }
+
+    func testCancellingRunnerWhileStandardInputIsBackpressuredReapsOwnedProcess() async throws {
+        let pidFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lumisync-cancelled-input-\(UUID().uuidString).pid")
+        defer { try? FileManager.default.removeItem(at: pidFile) }
+        let request = fixture(
+            command: "printf '%s' $$ > \(pidFile.path); sleep 30",
+            standardInput: Data(repeating: 0x61, count: 4 * 1_024 * 1_024),
+            timeout: .seconds(2)
+        )
+        let ownedRunner = BoundedOwnedProcessRunner()
+        let task = Task {
+            await ownedRunner.run(request)
+        }
+        let pid = try XCTUnwrap(waitForPID(in: pidFile))
+        let started = ContinuousClock.now
+
+        task.cancel()
+        let result = await task.value
+
+        XCTAssertEqual(result.termination, .failed("cancelled"))
+        XCTAssertNil(result.exitStatus)
+        XCTAssertTrue(result.cleanupVerified)
+        XCTAssertTrue(waitUntilGone(pid))
+        XCTAssertLessThan(started.duration(to: .now), .seconds(1))
+    }
+
+    func testCancellingRunnerWhileCollectingOutputReturnsPromptly() async throws {
+        let pidFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lumisync-cancelled-output-\(UUID().uuidString).pid")
+        defer { try? FileManager.default.removeItem(at: pidFile) }
+        let command = "python3 -c 'import os,time; os.setsid(); pid=os.fork(); pid and os._exit(0); time.sleep(0.1); open(\"\(pidFile.path)\",\"w\").write(str(os.getpid())); time.sleep(30)' & exit 0"
+        let request = fixture(command: command, timeout: .seconds(2))
+        let ownedRunner = BoundedOwnedProcessRunner()
+        let task = Task {
+            await ownedRunner.run(request)
+        }
+        let escapedPID = try XCTUnwrap(waitForPID(in: pidFile))
+        defer {
+            _ = kill(escapedPID, SIGKILL)
+            _ = waitUntilGone(escapedPID)
+        }
+        usleep(50_000)
+        let started = ContinuousClock.now
+
+        task.cancel()
+        let result = await task.value
+
+        XCTAssertEqual(result.termination, .failed("cancelled"))
+        XCTAssertNil(result.exitStatus)
+        XCTAssertFalse(result.cleanupVerified)
+        XCTAssertLessThan(started.duration(to: .now), .seconds(1))
+    }
+
     func testRunnerResetsInheritedIgnoredTerminationSignals() async {
         let previousINT = Darwin.signal(SIGINT, SIG_IGN)
         let previousTERM = Darwin.signal(SIGTERM, SIG_IGN)
@@ -286,6 +364,18 @@ final class BoundedProcessTests: XCTestCase {
         tracker.refreshDescendants(of: 1_234)
 
         XCTAssertFalse(tracker.cleanupIsVerified(groupIsGone: true))
+    }
+
+    private func waitForPID(in url: URL) -> pid_t? {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while ContinuousClock.now < deadline {
+            if let contents = try? String(contentsOf: url, encoding: .utf8),
+               let pid = Int32(contents) {
+                return pid
+            }
+            usleep(5_000)
+        }
+        return nil
     }
 
     private func waitUntilGone(_ pid: pid_t) -> Bool {

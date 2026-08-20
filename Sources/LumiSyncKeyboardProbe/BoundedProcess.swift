@@ -197,7 +197,9 @@ public actor BoundedOwnedProcessRunner: OwnedProcessRunning {
                 return OwnedProcessResult(
                     termination: error is StandardInputWriteTimeout
                         ? .timedOut
-                        : .failed(String(describing: error)),
+                        : error is StandardInputWriteCancellation
+                            ? .failed("cancelled")
+                            : .failed(String(describing: error)),
                     exitStatus: nil,
                     stdout: Data(),
                     stderr: Data(),
@@ -228,6 +230,19 @@ public actor BoundedOwnedProcessRunner: OwnedProcessRunning {
                     break
                 }
                 process.refreshDescendants()
+                if Task.isCancelled {
+                    let cleanup = await terminateAndReap(process)
+                    process.closeOutput()
+                    let descendantsVerified = await process.cleanupVerified()
+                    return OwnedProcessResult(
+                        termination: .failed("cancelled"),
+                        exitStatus: nil,
+                        stdout: Data(),
+                        stderr: Data(),
+                        rootPID: process.pid,
+                        cleanupVerified: cleanup.didReap && descendantsVerified
+                    )
+                }
                 if clock.now >= deadline {
                     termination = .timedOut
                     process.refreshDescendants()
@@ -263,7 +278,10 @@ public actor BoundedOwnedProcessRunner: OwnedProcessRunning {
                 let collection = await process.collectOutput(until: deadline)
                 process.closeOutput()
                 output = (collection.stdout, collection.stderr)
-                if let readError = collection.readError {
+                if collection.cancelled {
+                    termination = .failed("cancelled")
+                    outputCollectionFailed = true
+                } else if let readError = collection.readError {
                     termination = .failed(readError)
                     outputCollectionFailed = true
                 } else if !collection.reachedEOF {
@@ -372,9 +390,11 @@ private struct OutputCollection {
     let stderr: Data
     let reachedEOF: Bool
     let readError: String?
+    let cancelled: Bool
 }
 
 private struct StandardInputWriteTimeout: Error {}
+private struct StandardInputWriteCancellation: Error {}
 
 private enum SpawnedProcessError: Error, CustomStringConvertible {
     case spawn(Int32)
@@ -569,6 +589,9 @@ private final class SpawnedProcess: @unchecked Sendable {
         let clock = ContinuousClock()
         var offset = 0
         while offset < data.count {
+            guard !Task.isCancelled else {
+                throw StandardInputWriteCancellation()
+            }
             guard clock.now < deadline else {
                 throw StandardInputWriteTimeout()
             }
@@ -726,8 +749,11 @@ private final class SpawnedProcess: @unchecked Sendable {
         while true {
             consumeAvailableData(from: output, isStdout: true)
             consumeAvailableData(from: error, isStdout: false)
-            let snapshot = outputSnapshot()
-            if snapshot.reachedEOF || snapshot.readError != nil || clock.now >= deadline {
+            let snapshot = outputSnapshot(cancelled: Task.isCancelled)
+            if snapshot.cancelled
+                || snapshot.reachedEOF
+                || snapshot.readError != nil
+                || clock.now >= deadline {
                 return snapshot
             }
             let remaining = clock.now.duration(to: deadline)
@@ -740,14 +766,15 @@ private final class SpawnedProcess: @unchecked Sendable {
         }
     }
 
-    private func outputSnapshot() -> OutputCollection {
+    private func outputSnapshot(cancelled: Bool) -> OutputCollection {
         outputLock.lock()
         defer { outputLock.unlock() }
         return OutputCollection(
             stdout: stdoutBuffer,
             stderr: stderrBuffer,
             reachedEOF: stdoutReachedEOF && stderrReachedEOF,
-            readError: outputReadError
+            readError: outputReadError,
+            cancelled: cancelled
         )
     }
 
