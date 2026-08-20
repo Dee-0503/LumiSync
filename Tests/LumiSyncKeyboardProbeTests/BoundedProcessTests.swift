@@ -22,6 +22,49 @@ final class BoundedProcessTests: XCTestCase {
         XCTAssertTrue(result.cleanupVerified)
     }
 
+    func testRunnerDrainsStdoutAndStderrConcurrently() async {
+        let result = await runner.run(
+            fixture(
+                command: "python3 -c 'import os; os.write(2, b\"e\" * 1048576); os.write(1, b\"o\" * 1048576)'",
+                timeout: .seconds(2)
+            )
+        )
+
+        XCTAssertEqual(result.termination, .failed("output limit exceeded"))
+        XCTAssertNil(result.exitStatus)
+        XCTAssertEqual(result.stdout.count, 65_536)
+        XCTAssertEqual(result.stderr.count, 65_536)
+        XCTAssertTrue(result.cleanupVerified)
+    }
+
+    func testRunnerMarksTruncatedOutputAsProtocolFailure() async {
+        let result = await runner.run(
+            fixture(
+                command: "python3 -c 'import os; os.write(1, b\"o\" * 65537)'",
+                timeout: .seconds(2)
+            )
+        )
+
+        XCTAssertEqual(result.termination, .failed("output limit exceeded"))
+        XCTAssertEqual(result.stdout.count, 65_536)
+        XCTAssertTrue(result.cleanupVerified)
+    }
+
+    func testRunnerCleansUpSpawnedProcessWhenWritingStandardInputFails() async throws {
+        let result = await runner.run(
+            fixture(
+                command: "exec 0<&-; sleep 30",
+                standardInput: Data(repeating: 0x61, count: 1_048_576),
+                timeout: .seconds(2)
+            )
+        )
+
+        XCTAssertNotEqual(result.termination, .exited)
+        let pid = try XCTUnwrap(result.rootPID)
+        XCTAssertTrue(result.cleanupVerified)
+        XCTAssertTrue(waitUntilGone(pid))
+    }
+
     func testRunnerResetsInheritedIgnoredTerminationSignals() async {
         let previousINT = Darwin.signal(SIGINT, SIG_IGN)
         let previousTERM = Darwin.signal(SIGTERM, SIG_IGN)
@@ -89,6 +132,114 @@ final class BoundedProcessTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: pidFile.path))
     }
 
+    func testDescendantCleanupDoesNotSignalPIDWhenIdentityCheckDetectsReuse() {
+        let owned = OwnedProcessIdentity(pid: 4_242, startSeconds: 10, startMicroseconds: 1)
+        let replacement = OwnedProcessIdentity(pid: 4_242, startSeconds: 20, startMicroseconds: 2)
+        var signals: [(pid_t, Int32)] = []
+        let tracker = DescendantProcessTracker(
+            operations: DescendantProcessOperations(
+                observe: { _ in .running(replacement) },
+                signal: { signals.append(($0, $1)) },
+                children: { _ in .complete([]) },
+                groupIsGone: { _ in true }
+            )
+        )
+        tracker.track(owned)
+
+        tracker.signalKnownDescendants(SIGKILL)
+
+        XCTAssertTrue(signals.isEmpty)
+        XCTAssertTrue(tracker.cleanupIsVerified(groupIsGone: true))
+    }
+
+    func testDescendantCleanupFailsClosedWhenIdentityIsUnavailable() {
+        let owned = OwnedProcessIdentity(pid: 4_242, startSeconds: 10, startMicroseconds: 1)
+        var signals: [(pid_t, Int32)] = []
+        let tracker = DescendantProcessTracker(
+            operations: DescendantProcessOperations(
+                observe: { _ in .unavailable },
+                signal: { signals.append(($0, $1)) },
+                children: { _ in .complete([]) },
+                groupIsGone: { _ in true }
+            )
+        )
+        tracker.track(owned)
+
+        tracker.signalKnownDescendants(SIGTERM)
+
+        XCTAssertTrue(signals.isEmpty)
+        XCTAssertFalse(tracker.cleanupIsVerified(groupIsGone: true))
+    }
+
+    func testDescendantCleanupSignalsOnlyMatchingLiveIdentity() {
+        let owned = OwnedProcessIdentity(pid: 4_242, startSeconds: 10, startMicroseconds: 1)
+        var signals: [(pid_t, Int32)] = []
+        let tracker = DescendantProcessTracker(
+            operations: DescendantProcessOperations(
+                observe: { _ in .running(owned) },
+                signal: { signals.append(($0, $1)) },
+                children: { _ in .complete([]) },
+                groupIsGone: { _ in true }
+            )
+        )
+        tracker.track(owned)
+
+        tracker.signalKnownDescendants(SIGTERM)
+        tracker.signalKnownDescendants(SIGKILL)
+
+        XCTAssertEqual(signals.map(\.0), [4_242, 4_242])
+        XCTAssertEqual(signals.map(\.1), [SIGTERM, SIGKILL])
+        XCTAssertFalse(tracker.cleanupIsVerified(groupIsGone: true))
+    }
+
+    func testIncompleteDescendantDiscoveryFailsCleanupClosed() {
+        let tracker = DescendantProcessTracker(
+            operations: DescendantProcessOperations(
+                observe: { _ in .unavailable },
+                signal: { _, _ in },
+                children: { _ in .incomplete([]) },
+                groupIsGone: { _ in true }
+            )
+        )
+
+        tracker.refreshDescendants(of: 1_234)
+
+        XCTAssertFalse(tracker.cleanupIsVerified(groupIsGone: true))
+    }
+
+    func testDiscoveredChildWithUnavailableIdentityFailsCleanupClosed() {
+        let childPID: pid_t = 4_242
+        let tracker = DescendantProcessTracker(
+            operations: DescendantProcessOperations(
+                observe: { _ in .unavailable },
+                signal: { _, _ in },
+                children: { parent in
+                    parent == 1_234 ? .complete([childPID]) : .complete([])
+                },
+                groupIsGone: { _ in true }
+            )
+        )
+
+        tracker.refreshDescendants(of: 1_234)
+
+        XCTAssertFalse(tracker.cleanupIsVerified(groupIsGone: true))
+    }
+
+    func testUnavailableDescendantDiscoveryFailsCleanupClosed() {
+        let tracker = DescendantProcessTracker(
+            operations: DescendantProcessOperations(
+                observe: { _ in .unavailable },
+                signal: { _, _ in },
+                children: { _ in .unavailable },
+                groupIsGone: { _ in true }
+            )
+        )
+
+        tracker.refreshDescendants(of: 1_234)
+
+        XCTAssertFalse(tracker.cleanupIsVerified(groupIsGone: true))
+    }
+
     private func waitUntilGone(_ pid: pid_t) -> Bool {
         let deadline = ContinuousClock.now.advanced(by: .seconds(5))
         while ContinuousClock.now < deadline {
@@ -111,11 +262,15 @@ final class BoundedProcessTests: XCTestCase {
         return size <= 0 || info.pbi_status == UInt32(SZOMB)
     }
 
-    private func fixture(command: String, timeout: Duration) -> OwnedProcessRequest {
+    private func fixture(
+        command: String,
+        standardInput: Data = Data(),
+        timeout: Duration
+    ) -> OwnedProcessRequest {
         OwnedProcessRequest(
             executableURL: URL(fileURLWithPath: "/bin/sh"),
             arguments: ["-c", command],
-            standardInput: Data(),
+            standardInput: standardInput,
             timeout: timeout
         )
     }

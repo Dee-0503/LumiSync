@@ -59,6 +59,118 @@ public protocol OwnedProcessRunning: Sendable {
     func run(_ request: OwnedProcessRequest) async -> OwnedProcessResult
 }
 
+internal struct OwnedProcessIdentity: Hashable, Sendable {
+    let pid: pid_t
+    let startSeconds: UInt64
+    let startMicroseconds: UInt64
+}
+
+internal enum ObservedOwnedProcess: Equatable, Sendable {
+    case missing
+    case running(OwnedProcessIdentity)
+    case zombie(OwnedProcessIdentity)
+    case unavailable
+}
+
+internal enum ChildPIDSnapshot: Equatable, Sendable {
+    case complete([pid_t])
+    case incomplete([pid_t])
+    case unavailable
+}
+
+internal struct DescendantProcessOperations: @unchecked Sendable {
+    let observe: (pid_t) -> ObservedOwnedProcess
+    let signal: (pid_t, Int32) -> Void
+    let children: (pid_t) -> ChildPIDSnapshot
+    let groupIsGone: (pid_t) -> Bool
+}
+
+internal final class DescendantProcessTracker: @unchecked Sendable {
+    private let operations: DescendantProcessOperations
+    private var knownDescendants: Set<OwnedProcessIdentity> = []
+    private var unresolvedDescendantPIDs: Set<pid_t> = []
+    private var discoveryIncomplete = false
+
+    init(operations: DescendantProcessOperations) {
+        self.operations = operations
+    }
+
+    func track(_ identity: OwnedProcessIdentity) {
+        knownDescendants.insert(identity)
+    }
+
+    func refreshDescendants(of rootPID: pid_t) {
+        var discovered = Set<pid_t>()
+        var frontier = [rootPID]
+        while let parent = frontier.popLast() {
+            let snapshot = operations.children(parent)
+            let children: [pid_t]
+            switch snapshot {
+            case .complete(let values):
+                children = values
+            case .incomplete(let values):
+                discoveryIncomplete = true
+                children = values
+            case .unavailable:
+                discoveryIncomplete = true
+                children = []
+            }
+            for child in children where child > 0 && discovered.insert(child).inserted {
+                frontier.append(child)
+                switch operations.observe(child) {
+                case .running(let identity), .zombie(let identity):
+                    unresolvedDescendantPIDs.remove(child)
+                    track(identity)
+                case .missing:
+                    unresolvedDescendantPIDs.remove(child)
+                case .unavailable:
+                    unresolvedDescendantPIDs.insert(child)
+                }
+            }
+        }
+    }
+
+    func signalKnownDescendants(_ signal: Int32) {
+        for identity in knownDescendants where identity.pid > 0 {
+            guard case .running(let current) = operations.observe(identity.pid),
+                  current == identity else {
+                continue
+            }
+            operations.signal(identity.pid, signal)
+        }
+    }
+
+    func cleanupIsVerified(groupIsGone: Bool) -> Bool {
+        guard groupIsGone, !discoveryIncomplete else { return false }
+        var resolvedIdentities: [OwnedProcessIdentity] = []
+        unresolvedDescendantPIDs = unresolvedDescendantPIDs.filter { pid in
+            switch operations.observe(pid) {
+            case .missing, .zombie:
+                return false
+            case .running(let identity):
+                resolvedIdentities.append(identity)
+                return false
+            case .unavailable:
+                return true
+            }
+        }
+        resolvedIdentities.forEach(track)
+        guard unresolvedDescendantPIDs.isEmpty else { return false }
+        return knownDescendants.allSatisfy { identity in
+            switch operations.observe(identity.pid) {
+            case .missing:
+                return true
+            case .zombie:
+                return true
+            case .running(let current):
+                return current != identity
+            case .unavailable:
+                return false
+            }
+        }
+    }
+}
+
 public actor BoundedOwnedProcessRunner: OwnedProcessRunning {
     fileprivate static let maximumOutputBytes = 64 * 1024
     private static let terminationGraceNanoseconds: UInt64 = 100_000_000
@@ -127,6 +239,9 @@ public actor BoundedOwnedProcessRunner: OwnedProcessRunning {
                 output = (Data(), Data())
             } else {
                 output = await process.collectOutput()
+                if process.outputLimitWasExceeded() {
+                    termination = .failed("output limit exceeded")
+                }
             }
             let cleanupVerified = didReap && process.cleanupVerified()
             return OwnedProcessResult(
@@ -136,6 +251,15 @@ public actor BoundedOwnedProcessRunner: OwnedProcessRunning {
                 stderr: output.stderr,
                 rootPID: process.pid,
                 cleanupVerified: cleanupVerified
+            )
+        } catch let error as SpawnedProcessError {
+            return OwnedProcessResult(
+                termination: .failed(error.description),
+                exitStatus: nil,
+                stdout: Data(),
+                stderr: Data(),
+                rootPID: error.spawnedPID,
+                cleanupVerified: error.cleanupVerified
             )
         } catch {
             return OwnedProcessResult(
@@ -172,33 +296,45 @@ public actor BoundedOwnedProcessRunner: OwnedProcessRunning {
         _ = kill(-groupID, SIGKILL)
     }
 
-    private static func groupIsGone(_ groupID: pid_t) -> Bool {
-        guard groupID > 0 else { return true }
-        if kill(-groupID, 0) == 0 { return false }
-        return errno == ESRCH
-    }
 }
 
 private enum SpawnedProcessError: Error, CustomStringConvertible {
     case spawn(Int32)
     case pipe(Int32)
+    case standardInput(String, pid_t, Bool)
 
     var description: String {
         switch self {
         case .spawn(let code): return "posix_spawn failed with errno \(code)"
         case .pipe(let code): return "pipe failed with errno \(code)"
+        case .standardInput(let message, _, _): return message
         }
+    }
+
+    var spawnedPID: pid_t? {
+        guard case .standardInput(_, let pid, _) = self else { return nil }
+        return pid
+    }
+
+    var cleanupVerified: Bool {
+        guard case .standardInput(_, _, let verified) = self else { return true }
+        return verified
     }
 }
 
 private final class SpawnedProcess: @unchecked Sendable {
     let pid: pid_t
     let groupID: pid_t
+    private static let maximumOutputBytes = BoundedOwnedProcessRunner.maximumOutputBytes
+
     private let input: FileHandle
     private let output: FileHandle
     private let error: FileHandle
-    private let outputQueue = DispatchQueue(label: "lumisync.bounded-process.output")
-    private var knownDescendantPIDs: Set<pid_t> = []
+    private let outputLock = NSLock()
+    private var stdoutBuffer = Data()
+    private var stderrBuffer = Data()
+    private var outputLimitExceeded = false
+    private let descendantTracker: DescendantProcessTracker
 
     init(request: OwnedProcessRequest) throws {
         var inputPipe = [Int32](repeating: 0, count: 2)
@@ -304,11 +440,71 @@ private final class SpawnedProcess: @unchecked Sendable {
         _ = close(errorPipe[1])
         pid = spawnedPID
         groupID = spawnedPID
+        descendantTracker = DescendantProcessTracker(operations: Self.descendantOperations)
         input = FileHandle(fileDescriptor: inputPipe[1], closeOnDealloc: true)
         output = FileHandle(fileDescriptor: outputPipe[0], closeOnDealloc: true)
         error = FileHandle(fileDescriptor: errorPipe[0], closeOnDealloc: true)
-        try input.write(contentsOf: request.standardInput)
-        closeInput()
+        output.readabilityHandler = { [weak self] handle in
+            self?.consumeAvailableData(from: handle, isStdout: true)
+        }
+        error.readabilityHandler = { [weak self] handle in
+            self?.consumeAvailableData(from: handle, isStdout: false)
+        }
+        do {
+            try Self.writeStandardInput(request.standardInput, to: input.fileDescriptor)
+            closeInput()
+        } catch {
+            closeInput()
+            Self.terminateProcessGroup(groupID)
+            terminateKnownDescendants()
+            let didReap = Self.reap(pid)
+            closeOutput()
+            let cleanupVerified = didReap && cleanupVerified()
+            throw SpawnedProcessError.standardInput(
+                String(describing: error),
+                pid,
+                cleanupVerified
+            )
+        }
+    }
+
+    private static func writeStandardInput(_ data: Data, to descriptor: Int32) throws {
+        guard fcntl(descriptor, F_SETNOSIGPIPE, 1) != -1 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+
+        try data.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else { return }
+            var offset = 0
+            while offset < rawBuffer.count {
+                let written = Darwin.write(
+                    descriptor,
+                    baseAddress.advanced(by: offset),
+                    rawBuffer.count - offset
+                )
+                if written > 0 {
+                    offset += written
+                    continue
+                }
+                if written == -1 && errno == EINTR { continue }
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+        }
+    }
+
+    private static func terminateProcessGroup(_ groupID: pid_t) {
+        guard groupID > 0 else { return }
+        _ = kill(-groupID, SIGKILL)
+    }
+
+    private static func reap(_ pid: pid_t) -> Bool {
+        var status: Int32 = 0
+        while true {
+            let result = waitpid(pid, &status, 0)
+            if result == pid { return true }
+            if result == -1 && errno == EINTR { continue }
+            return result == -1 && errno == ECHILD
+        }
     }
 
     func closeInput() {
@@ -316,98 +512,141 @@ private final class SpawnedProcess: @unchecked Sendable {
     }
 
     func closeOutput() {
+        output.readabilityHandler = nil
+        error.readabilityHandler = nil
         try? output.close()
         try? error.close()
-    }
-
-    private func processIsGoneOrZombie(_ pid: pid_t) -> Bool {
-        if kill(pid, 0) == -1 { return errno == ESRCH }
-        var info = proc_bsdinfo()
-        let size = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size))
-        return size <= 0 || info.pbi_status == UInt32(SZOMB)
     }
 
     func cleanupVerified() -> Bool {
         let deadline = ContinuousClock.now.advanced(by: .seconds(2))
         while ContinuousClock.now < deadline {
-            if knownDescendantPIDs.allSatisfy(processIsGoneOrZombie) && groupIsGone() {
+            if descendantTracker.cleanupIsVerified(
+                groupIsGone: Self.descendantOperations.groupIsGone(groupID)
+            ) {
                 return true
             }
-            for childPID in knownDescendantPIDs where childPID > 0 {
-                _ = kill(childPID, SIGKILL)
-            }
+            descendantTracker.signalKnownDescendants(SIGKILL)
             usleep(5_000)
         }
-        return knownDescendantPIDs.allSatisfy(processIsGoneOrZombie) && groupIsGone()
-    }
-
-    private func groupIsGone() -> Bool {
-        guard groupID > 0 else { return true }
-        if kill(-groupID, 0) == 0 { return false }
-        return errno == ESRCH
+        return descendantTracker.cleanupIsVerified(
+            groupIsGone: Self.descendantOperations.groupIsGone(groupID)
+        )
     }
 
     func terminateKnownDescendants() {
-        knownDescendantPIDs.formUnion(Self.descendantPIDs(of: pid))
-        for childPID in knownDescendantPIDs where childPID > 0 {
-            _ = kill(childPID, SIGTERM)
-        }
-        for childPID in knownDescendantPIDs where childPID > 0 {
-            _ = kill(childPID, SIGKILL)
-        }
+        refreshDescendants()
+        descendantTracker.signalKnownDescendants(SIGTERM)
+        descendantTracker.signalKnownDescendants(SIGKILL)
     }
 
     func refreshDescendants() {
-        knownDescendantPIDs.formUnion(Self.descendantPIDs(of: pid))
+        descendantTracker.refreshDescendants(of: pid)
     }
 
-    private static func descendantPIDs(of rootPID: pid_t) -> Set<pid_t> {
-        var discovered = Set<pid_t>()
-        var frontier = [rootPID]
-        while let parent = frontier.popLast() {
-            var buffer = [pid_t](repeating: 0, count: 32)
-            let count = buffer.withUnsafeMutableBufferPointer {
-                proc_listchildpids(parent, $0.baseAddress, Int32($0.count * MemoryLayout<pid_t>.size))
+    private static let descendantOperations = DescendantProcessOperations(
+        observe: { pid in
+            if kill(pid, 0) == -1 {
+                return errno == ESRCH ? .missing : .unavailable
             }
-            guard count > 0 else { continue }
-            let childCount = Int(count)
-            for child in buffer.prefix(childCount) where child > 0 && discovered.insert(child).inserted {
-                frontier.append(child)
-            }
+            var info = proc_bsdinfo()
+            let size = proc_pidinfo(
+                pid,
+                PROC_PIDTBSDINFO,
+                0,
+                &info,
+                Int32(MemoryLayout<proc_bsdinfo>.size)
+            )
+            guard size == MemoryLayout<proc_bsdinfo>.size else { return .unavailable }
+            let identity = OwnedProcessIdentity(
+                pid: pid,
+                startSeconds: info.pbi_start_tvsec,
+                startMicroseconds: info.pbi_start_tvusec
+            )
+            return info.pbi_status == UInt32(SZOMB)
+                ? .zombie(identity)
+                : .running(identity)
+        },
+        signal: { pid, signal in
+            _ = kill(pid, signal)
+        },
+        children: { pid in
+            descendantPIDs(of: pid)
+        },
+        groupIsGone: { groupID in
+            guard groupID > 0 else { return true }
+            if kill(-groupID, 0) == 0 { return false }
+            return errno == ESRCH
         }
-        return discovered
+    )
+
+    private static let maximumChildPIDCount = 4_096
+
+    private static func descendantPIDs(of parent: pid_t) -> ChildPIDSnapshot {
+        var capacity = 32
+        while capacity <= maximumChildPIDCount {
+            var buffer = [pid_t](repeating: 0, count: capacity)
+            let returnedCount = buffer.withUnsafeMutableBufferPointer {
+                proc_listchildpids(
+                    parent,
+                    $0.baseAddress,
+                    Int32($0.count * MemoryLayout<pid_t>.stride)
+                )
+            }
+            guard returnedCount >= 0 else { return .unavailable }
+            let count = min(Int(returnedCount), buffer.count)
+            let children = Array(buffer.prefix(count)).filter { $0 > 0 }
+            guard Int(returnedCount) < buffer.count else {
+                guard capacity < maximumChildPIDCount else {
+                    return .incomplete(children)
+                }
+                capacity = min(capacity * 2, maximumChildPIDCount)
+                continue
+            }
+            return .complete(children)
+        }
+        return .unavailable
     }
 
     func collectOutput() async -> (stdout: Data, stderr: Data) {
-        await withTaskGroup(of: (Bool, Data).self, returning: (Data, Data).self) { group in
-            group.addTask { [output, outputQueue] in
-                (true, Self.readBounded(output, queue: outputQueue))
-            }
-            group.addTask { [error, outputQueue] in
-                (false, Self.readBounded(error, queue: outputQueue))
-            }
-            var stdout = Data()
-            var stderr = Data()
-            while let (isStdout, data) = await group.next() {
-                if isStdout {
-                    stdout = data
-                } else {
-                    stderr = data
-                }
-            }
-            return (stdout, stderr)
+        collectOutputSynchronously()
+    }
+
+    private func collectOutputSynchronously() -> (stdout: Data, stderr: Data) {
+        output.readabilityHandler = nil
+        error.readabilityHandler = nil
+        consumeAvailableData(from: output, isStdout: true)
+        consumeAvailableData(from: error, isStdout: false)
+        outputLock.lock()
+        defer { outputLock.unlock() }
+        return (stdoutBuffer, stderrBuffer)
+    }
+
+    private func consumeAvailableData(from handle: FileHandle, isStdout: Bool) {
+        let data = handle.availableData
+        guard !data.isEmpty else { return }
+        outputLock.lock()
+        defer { outputLock.unlock() }
+        let remaining = Self.maximumOutputBytes - (isStdout ? stdoutBuffer.count : stderrBuffer.count)
+        if data.count > remaining {
+            outputLimitExceeded = true
+        }
+        if isStdout {
+            Self.appendBounded(data, to: &stdoutBuffer)
+        } else {
+            Self.appendBounded(data, to: &stderrBuffer)
         }
     }
 
-    private static func readBounded(_ handle: FileHandle, queue: DispatchQueue) -> Data {
-        queue.sync {
-            var result = Data()
-            while result.count < BoundedOwnedProcessRunner.maximumOutputBytes {
-                let data = handle.readData(ofLength: min(4096, BoundedOwnedProcessRunner.maximumOutputBytes - result.count))
-                if data.isEmpty { break }
-                result.append(data)
-            }
-            return result
-        }
+    func outputLimitWasExceeded() -> Bool {
+        outputLock.lock()
+        defer { outputLock.unlock() }
+        return outputLimitExceeded
+    }
+
+    private static func appendBounded(_ data: Data, to buffer: inout Data) {
+        let remaining = maximumOutputBytes - buffer.count
+        guard remaining > 0 else { return }
+        buffer.append(data.prefix(remaining))
     }
 }
