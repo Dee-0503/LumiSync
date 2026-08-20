@@ -102,11 +102,13 @@ final class QualificationTests: XCTestCase {
             ObjectiveCSelectorSignature(name: "brightnessForKeyboard:", typeEncoding: "f@:Q"),
             ObjectiveCSelectorSignature(name: "setBrightness:forKeyboard:", typeEncoding: "B@:fQ")
         ])
-        XCTAssertEqual(provider.requestedSelectors, [
-            "copyKeyboardBacklightIDs",
-            "isKeyboardBuiltIn:",
-            "brightnessForKeyboard:",
-            "setBrightness:forKeyboard:"
+        XCTAssertEqual(provider.events, [
+            "load",
+            "class:KeyboardBrightnessClient",
+            "encoding:copyKeyboardBacklightIDs",
+            "encoding:isKeyboardBuiltIn:",
+            "encoding:brightnessForKeyboard:",
+            "encoding:setBrightness:forKeyboard:"
         ])
     }
 }
@@ -141,22 +143,24 @@ private extension QualificationTests {
 
 private final class RecordingObjectiveCMetadataProvider: ObjectiveCMetadataProviding {
     private let encodings: [String: String]
-    private(set) var requestedSelectors: [String] = []
+    private(set) var events: [String] = []
 
     init(encodings: [String: String]) {
         self.encodings = encodings
     }
 
-    func frameworkIsPresent(at path: String) -> Bool {
-        true
+    func loadFramework(at path: String) -> Bool {
+        events.append("load")
+        return true
     }
 
     func classIsPresent(named name: String) -> Bool {
-        true
+        events.append("class:\(name)")
+        return true
     }
 
     func typeEncoding(classNamed name: String, selectorNamed selectorName: String) -> String? {
-        requestedSelectors.append(selectorName)
+        events.append("encoding:\(selectorName)")
         return encodings[selectorName]
     }
 }

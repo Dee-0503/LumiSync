@@ -28,14 +28,15 @@ public enum CoreBrightnessBackendError: Error, CustomStringConvertible {
 }
 
 public protocol ObjectiveCMetadataProviding: AnyObject {
-    func frameworkIsPresent(at path: String) -> Bool
+    func loadFramework(at path: String) -> Bool
     func classIsPresent(named name: String) -> Bool
     func typeEncoding(classNamed name: String, selectorNamed selectorName: String) -> String?
 }
 
 private final class RuntimeObjectiveCMetadataProvider: ObjectiveCMetadataProviding {
-    func frameworkIsPresent(at path: String) -> Bool {
-        Bundle(path: path) != nil
+    func loadFramework(at path: String) -> Bool {
+        guard let bundle = Bundle(path: path) else { return false }
+        return bundle.isLoaded || bundle.load()
     }
 
     func classIsPresent(named name: String) -> Bool {
@@ -92,7 +93,7 @@ public final class CoreBrightnessKeyboardBacklightBackend: KeyboardBacklightBack
     public static func inspectSignatures(
         metadataProvider: ObjectiveCMetadataProviding
     ) throws -> CoreBrightnessSignatureInspection {
-        let frameworkPresent = metadataProvider.frameworkIsPresent(at: frameworkPath)
+        let frameworkPresent = metadataProvider.loadFramework(at: frameworkPath)
         let classPresent = frameworkPresent
             && metadataProvider.classIsPresent(named: clientClassName)
         let signatures = classPresent ? inspectedSelectorNames.compactMap { selectorName in
