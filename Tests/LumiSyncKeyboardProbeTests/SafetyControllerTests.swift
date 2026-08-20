@@ -12,7 +12,7 @@ final class SafetyControllerTests: XCTestCase {
         async let first = controller.submit(firstRequest)
         async let second = controller.submit(secondRequest)
         await supervisor.release()
-        let results = try await (first, second)
+        let results = await (first, second)
 
         XCTAssertEqual(results.0, .success(readback: try NormalizedBacklightValue(0.5)))
         XCTAssertEqual(results.1, results.0)
@@ -29,7 +29,7 @@ final class SafetyControllerTests: XCTestCase {
         await supervisor.waitForCall()
         let second = await controller.submit(try makeSetRequest(0.8, id: "b"))
         await supervisor.release()
-        _ = try await first
+        _ = await first
 
         XCTAssertEqual(
             second,
