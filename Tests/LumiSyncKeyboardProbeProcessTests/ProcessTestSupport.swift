@@ -75,7 +75,8 @@ final class ProcessHarness {
                 executableURL: executableURL,
                 standardInput: input,
                 timeout: timeout,
-                environment: environment
+                environment: environment,
+                descendantPolicy: .executableContractNoDescendants
             )
         )
         return ProcessResult(

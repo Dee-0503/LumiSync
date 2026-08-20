@@ -8,25 +8,33 @@ public enum OwnedProcessTermination: Equatable, Sendable {
     case failed(String)
 }
 
+public enum OwnedProcessDescendantPolicy: Equatable, Sendable {
+    case unverified
+    case executableContractNoDescendants
+}
+
 public struct OwnedProcessRequest: Sendable {
     public let executableURL: URL
     public let arguments: [String]
     public let standardInput: Data
     public let timeout: Duration
     public let environment: [String: String]?
+    public let descendantPolicy: OwnedProcessDescendantPolicy
 
     public init(
         executableURL: URL,
         arguments: [String] = [],
         standardInput: Data = Data(),
         timeout: Duration,
-        environment: [String: String]? = nil
+        environment: [String: String]? = nil,
+        descendantPolicy: OwnedProcessDescendantPolicy = .unverified
     ) {
         self.executableURL = executableURL
         self.arguments = arguments
         self.standardInput = standardInput
         self.timeout = timeout
         self.environment = environment
+        self.descendantPolicy = descendantPolicy
     }
 }
 
@@ -295,7 +303,9 @@ public actor BoundedOwnedProcessRunner: OwnedProcessRunning {
             let descendantsVerified = outputCollectionFailed
                 ? false
                 : await process.cleanupVerified()
-            let cleanupVerified = didReap && descendantsVerified
+            let cleanupVerified = didReap
+                && descendantsVerified
+                && request.descendantPolicy == .executableContractNoDescendants
             return OwnedProcessResult(
                 termination: termination,
                 exitStatus: termination == .exited ? Self.exitStatus(for: waitStatus) : nil,
@@ -460,6 +470,8 @@ private final class SpawnedProcess: @unchecked Sendable {
     private let descendantTracker: DescendantProcessTracker
 
     init(request: OwnedProcessRequest) throws {
+        let reservedStandardDescriptors = try Self.reserveClosedStandardDescriptors()
+        defer { Self.closeDescriptors(reservedStandardDescriptors) }
         var inputPipe = [Int32](repeating: -1, count: 2)
         var outputPipe = [Int32](repeating: -1, count: 2)
         var errorPipe = [Int32](repeating: -1, count: 2)
@@ -585,6 +597,26 @@ private final class SpawnedProcess: @unchecked Sendable {
         error.readabilityHandler = { [weak self] handle in
             self?.consumeAvailableData(from: handle, isStdout: false)
         }
+    }
+
+    private static func reserveClosedStandardDescriptors() throws -> [Int32] {
+        var reserved: [Int32] = []
+        for descriptor in [STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO] {
+            guard fcntl(descriptor, F_GETFD) == -1, errno == EBADF else { continue }
+            let replacement = open("/dev/null", O_RDWR)
+            guard replacement >= 0 else {
+                closeDescriptors(reserved)
+                throw SpawnedProcessError.pipe(errno)
+            }
+            guard replacement == descriptor else {
+                let code = EIO
+                _ = close(replacement)
+                closeDescriptors(reserved)
+                throw SpawnedProcessError.pipe(code)
+            }
+            reserved.append(replacement)
+        }
+        return reserved
     }
 
     private static func closeDescriptors(_ descriptors: [Int32]) {

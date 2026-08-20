@@ -22,6 +22,30 @@ final class BoundedProcessTests: XCTestCase {
         XCTAssertTrue(result.cleanupVerified)
     }
 
+    func testRunnerPreservesChildStandardIOWhenParentDescriptorsAreClosed() async throws {
+        let backups = [STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO].map {
+            fcntl($0, F_DUPFD_CLOEXEC, 10)
+        }
+        XCTAssertTrue(backups.allSatisfy { $0 >= 10 })
+        for descriptor in [STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO] {
+            XCTAssertEqual(close(descriptor), 0)
+        }
+
+        let result = await runner.run(
+            fixture(command: "read value; printf 'out:%s' \"$value\"; printf err >&2", standardInput: Data("ok\n".utf8), timeout: .seconds(1))
+        )
+
+        for (descriptor, backup) in zip([STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO], backups) {
+            XCTAssertEqual(dup2(backup, descriptor), descriptor)
+            _ = close(backup)
+        }
+        XCTAssertEqual(result.termination, .exited)
+        XCTAssertEqual(result.exitStatus, 0)
+        XCTAssertEqual(String(decoding: result.stdout, as: UTF8.self), "out:ok")
+        XCTAssertEqual(String(decoding: result.stderr, as: UTF8.self), "err")
+        XCTAssertTrue(result.cleanupVerified)
+    }
+
     func testRunnerDrainsStdoutAndStderrConcurrently() async {
         let result = await runner.run(
             fixture(
@@ -269,6 +293,42 @@ final class BoundedProcessTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: pidFile.path))
     }
 
+    func testRunnerFailsClosedForReparentedDoubleForkAfterStandardIOCloses() async throws {
+        let pidFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lumisync-double-fork-\(UUID().uuidString).pid")
+        defer { try? FileManager.default.removeItem(at: pidFile) }
+        let script = """
+        import os,time
+        if os.fork() == 0:
+            os.setsid()
+            if os.fork() > 0:
+                os._exit(0)
+            os.close(0); os.close(1); os.close(2)
+            open(\"\(pidFile.path)\", \"w\").write(str(os.getpid()))
+            time.sleep(30)
+        while not os.path.exists(\"\(pidFile.path)\"):
+            time.sleep(0.001)
+        """
+
+        let result = await runner.run(
+            OwnedProcessRequest(
+                executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+                arguments: ["-c", script],
+                timeout: .seconds(1),
+                descendantPolicy: .unverified
+            )
+        )
+
+        let escapedPID = try XCTUnwrap(waitForPID(in: pidFile))
+        defer {
+            _ = kill(escapedPID, SIGKILL)
+            _ = waitUntilGone(escapedPID)
+        }
+        XCTAssertEqual(result.termination, .exited)
+        XCTAssertEqual(result.exitStatus, 0)
+        XCTAssertFalse(result.cleanupVerified)
+    }
+
     func testRunnerFailsClosedWhenUnscannedSetsidDescendantKeepsOutputPipesOpen() async throws {
         let pidFile = FileManager.default.temporaryDirectory
             .appendingPathComponent("lumisync-output-escape-\(UUID().uuidString).pid")
@@ -442,13 +502,15 @@ final class BoundedProcessTests: XCTestCase {
     private func fixture(
         command: String,
         standardInput: Data = Data(),
-        timeout: Duration
+        timeout: Duration,
+        descendantPolicy: OwnedProcessDescendantPolicy = .executableContractNoDescendants
     ) -> OwnedProcessRequest {
         OwnedProcessRequest(
             executableURL: URL(fileURLWithPath: "/bin/sh"),
             arguments: ["-c", command],
             standardInput: standardInput,
-            timeout: timeout
+            timeout: timeout,
+            descendantPolicy: descendantPolicy
         )
     }
 }

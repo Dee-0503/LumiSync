@@ -174,7 +174,8 @@ public actor BacklightSafetySupervisor {
                 timeout: .nanoseconds(Int64(childNanoseconds)),
                 environment: [
                     "LUMISYNC_H1_FAKE_DEVICE_DIR": configuration.fakeDeviceDirectory.path
-                ]
+                ],
+                descendantPolicy: .executableContractNoDescendants
             )
         )
         if process.termination == .timedOut {
