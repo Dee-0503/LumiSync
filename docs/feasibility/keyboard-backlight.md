@@ -84,6 +84,43 @@ protocol are wired to that supervisor may the reference machine attempt `0.0`,
 private setter rejection, timeout, cleanup uncertainty, or restore uncertainty must
 leave the App capability unavailable and preserve the complete error context.
 
+## H1 fake-process gate evidence
+
+The H1 process suite exercises six XCTest cases and the following scenario matrices
+using only the fake backlight device:
+
+- normal controller → supervisor → writer set/readback with verified restoration;
+- malformed, oversized, truncated, trailing, version-mismatched, and unknown
+  protocol input without writer mutation or process leaks;
+- forked-child and `setsid` escape attempts contained after the writer root exits;
+- hard deadlines at capture, write, write-readback, restore, and restore-readback;
+- controller `SIGINT`, `SIGTERM`, `SIGABRT`, and `SIGKILL` recovery; and
+- writer `SIGINT`, `SIGTERM`, `SIGABRT`, and `SIGKILL` recovery.
+
+Run the focused gate with a unique scratch path and an outer 120-second bound:
+
+```bash
+python3 - <<'PY'
+import subprocess
+import tempfile
+with tempfile.TemporaryDirectory(prefix="lumisync-h1-") as scratch:
+    subprocess.run(
+        ["swift", "test", "--scratch-path", scratch,
+         "--filter", "LumiSyncKeyboardProbeProcessTests"],
+        check=True,
+        timeout=120,
+    )
+PY
+```
+
+`Scripts/verify-real-write-gate.sh` separately executes the public CLI guard and
+asserts that the helper CLI source targets contain no CoreBrightness access, the
+production App still injects `UnavailableKeyboardBacklightController`, and no H1
+helper executable is reachable from `LumiSyncApp.swift`.
+
+H1 proves fake multi-process containment only. Real CoreBrightness writes remain
+blocked and require separately authorized H2 reference-machine qualification.
+
 ## API research
 
 No public Apple SDK API was found for third-party control of the built-in keyboard
