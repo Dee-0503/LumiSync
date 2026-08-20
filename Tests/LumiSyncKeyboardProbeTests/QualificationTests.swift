@@ -112,6 +112,25 @@ final class QualificationTests: XCTestCase {
         ])
     }
 
+    func testCoreBrightnessBackendConstructionIsReadOnly() throws {
+        let backend = try CoreBrightnessKeyboardBacklightBackend(
+            runtimeProvider: RecordingCoreBrightnessRuntimeProvider()
+        )
+
+        XCTAssertEqual(try backend.keyboardIDs(), [42])
+        XCTAssertTrue(try backend.isBuiltIn(keyboardID: 42))
+        XCTAssertEqual(try backend.brightness(keyboardID: 42), 0.37)
+    }
+
+    func testCoreBrightnessBackendRejectsEveryWriteWithoutCallingRuntime() throws {
+        let runtime = RecordingCoreBrightnessRuntimeProvider()
+        let backend = try CoreBrightnessKeyboardBacklightBackend(runtimeProvider: runtime)
+
+        XCTAssertThrowsError(try backend.setBrightness(0.5, keyboardID: 42))
+        XCTAssertThrowsError(try backend.restoreBrightness(0.37, keyboardID: 42))
+        XCTAssertEqual(runtime.writeCalls, 0)
+    }
+
     func testQualificationAcceptsRuntimeOffsetsAfterCanonicalizingABI() {
         let runtime = fixture(selectorSignatures: [
             ObjectiveCSelectorSignature(name: "copyKeyboardBacklightIDs", typeEncoding: "@16@0:8"),
@@ -218,6 +237,27 @@ private extension QualificationTests {
                 ObjectiveCSelectorSignature(name: "setBrightness:forKeyboard:", typeEncoding: setterEncoding)
             ]
         )
+    }
+}
+
+private final class RecordingCoreBrightnessRuntimeProvider: CoreBrightnessRuntimeProviding {
+    private(set) var writeCalls = 0
+
+    func keyboardIDs() throws -> [UInt64] {
+        [42]
+    }
+
+    func isBuiltIn(keyboardID: UInt64) throws -> Bool {
+        true
+    }
+
+    func brightness(keyboardID: UInt64) throws -> Float {
+        0.37
+    }
+
+    func setBrightness(_ brightness: Float, keyboardID: UInt64) throws -> Bool {
+        writeCalls += 1
+        return true
     }
 }
 
