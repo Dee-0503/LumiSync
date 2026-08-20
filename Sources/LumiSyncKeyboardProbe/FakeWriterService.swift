@@ -91,7 +91,8 @@ public struct FakeWriterService {
         case .raise(let signal):
             _ = Darwin.raise(signal)
             return .failure(primary: .writerFailed, restoration: .notRequired)
-        case .hang:
+        case .hang(let stage):
+            try device.recordHangBarrier(stage: stage, requestID: requestID)
             while true {
                 _ = Darwin.pause()
             }
@@ -112,26 +113,46 @@ public struct FakeWriterService {
         requestID: BacklightRequestID,
         createSession: Bool
     ) throws {
+        var readyPipe = [Int32](repeating: -1, count: 2)
+        guard Darwin.pipe(&readyPipe) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+
         let childPID = rawFork()
         guard childPID >= 0 else {
+            _ = Darwin.close(readyPipe[0])
+            _ = Darwin.close(readyPipe[1])
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
         guard childPID == 0 else {
+            _ = Darwin.close(readyPipe[1])
+            var ready: UInt8 = 0
+            let count = Darwin.read(readyPipe[0], &ready, 1)
+            _ = Darwin.close(readyPipe[0])
+            guard count == 1 else {
+                throw POSIXError(.EIO)
+            }
+            let marker = try NormalizedBacklightValue(0.37)
+            try device.recordProcess(
+                requestID: requestID,
+                value: marker,
+                operationCategory: .restore,
+                processID: childPID
+            )
             _ = Darwin.raise(SIGSTOP)
             return
         }
+
+        _ = Darwin.close(readyPipe[0])
         if createSession {
             _ = setsid()
         }
+        var ready: UInt8 = 1
+        _ = Darwin.write(readyPipe[1], &ready, 1)
+        _ = Darwin.close(readyPipe[1])
         _ = Darwin.close(STDIN_FILENO)
         _ = Darwin.close(STDOUT_FILENO)
         _ = Darwin.close(STDERR_FILENO)
-        let marker = try! NormalizedBacklightValue(0.37)
-        try? device.write(
-            marker,
-            requestID: requestID,
-            operationCategory: .restore
-        )
         while true {
             _ = Darwin.pause()
         }

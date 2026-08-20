@@ -17,6 +17,12 @@ public struct BacklightSupervisorConfiguration: Sendable {
 }
 
 public actor BacklightSafetySupervisor {
+    private enum JournalEvidence {
+        case present
+        case absent
+        case unknown
+    }
+
     private struct StageExecution {
         let result: BacklightOperationResult
         let timedOut: Bool
@@ -87,6 +93,7 @@ public actor BacklightSafetySupervisor {
             }
             let mutationResult = resolvedMutationResult(
                 mutationExecution,
+                target: request.operation.targetValue,
                 requestID: request.requestID
             )
 
@@ -125,12 +132,13 @@ public actor BacklightSafetySupervisor {
             case .failure(let primary, _):
                 return .resolvedFailure(primary: primary, restoration: restoration)
             }
-        case .restore:
-            return await perform(
+        case .restore(let target):
+            let execution = await perform(
                 request,
                 stage: .restore,
                 operationDeadline: operationDeadline
-            ).result
+            )
+            return resultVerifyingReadback(execution.result, target: target)
         }
     }
 
@@ -192,14 +200,32 @@ public actor BacklightSafetySupervisor {
 
     private func resolvedMutationResult(
         _ execution: StageExecution,
+        target: NormalizedBacklightValue?,
         requestID: BacklightRequestID
     ) -> BacklightOperationResult {
-        guard execution.timedOut else { return execution.result }
-        let stage: BacklightStage = journalContains(
-            requestID: requestID,
-            category: .set
-        ) ? .writeReadback : .write
+        guard execution.timedOut else {
+            guard let target else { return execution.result }
+            return resultVerifyingReadback(execution.result, target: target)
+        }
+        let stage: BacklightStage
+        switch journalEvidence(requestID: requestID, category: .set) {
+        case .present:
+            stage = .writeReadback
+        case .absent, .unknown:
+            stage = .write
+        }
         return .failure(primary: .timedOut(stage: stage), restoration: .notRequired)
+    }
+
+    private func resultVerifyingReadback(
+        _ result: BacklightOperationResult,
+        target: NormalizedBacklightValue
+    ) -> BacklightOperationResult {
+        guard case .success(let readback) = result else { return result }
+        guard abs(readback.rawValue - target.rawValue) <= configuration.readbackTolerance else {
+            return .failure(primary: .readbackMismatch, restoration: .notRequired)
+        }
+        return result
     }
 
     private func restorationOutcome(
@@ -208,9 +234,12 @@ public actor BacklightSafetySupervisor {
         requestID: BacklightRequestID
     ) -> RestorationOutcome {
         if execution.timedOut {
-            return journalContains(requestID: requestID, category: .restore)
-                ? .uncertain
-                : .failed
+            switch journalEvidence(requestID: requestID, category: .restore) {
+            case .present, .unknown:
+                return .uncertain
+            case .absent:
+                return .failed
+            }
         }
         if case .success(let restored) = execution.result,
            abs(restored.rawValue - original.rawValue) <= configuration.readbackTolerance {
@@ -219,20 +248,20 @@ public actor BacklightSafetySupervisor {
         return .failed
     }
 
-    private func journalContains(
+    private func journalEvidence(
         requestID: BacklightRequestID,
         category: FakeBacklightOperationCategory
-    ) -> Bool {
+    ) -> JournalEvidence {
         guard let device = try? FileBackedFakeBacklightDevice(
             directory: configuration.fakeDeviceDirectory,
             processRole: .supervisor
         ),
         let entries = try? device.journalEntries() else {
-            return false
+            return .unknown
         }
         return entries.contains {
             $0.requestID == requestID && $0.operationCategory == category
-        }
+        } ? .present : .absent
     }
 
     private func childRequest(
@@ -264,6 +293,17 @@ public actor BacklightSafetySupervisor {
         let nanoseconds = UInt64(components.attoseconds) / 1_000_000_000
         return seconds.multipliedReportingOverflow(by: 1_000_000_000).partialValue
             .addingReportingOverflow(nanoseconds).partialValue
+    }
+}
+
+private extension BacklightOperation {
+    var targetValue: NormalizedBacklightValue? {
+        switch self {
+        case .read:
+            return nil
+        case .set(let value), .restore(let value):
+            return value
+        }
     }
 }
 

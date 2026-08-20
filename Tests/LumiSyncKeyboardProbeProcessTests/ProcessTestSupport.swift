@@ -121,6 +121,16 @@ final class ProcessHarness {
         )
     }
 
+    func stateSnapshot() throws -> Data {
+        try Data(contentsOf: directory.appendingPathComponent("state.json"))
+    }
+
+    func journalSnapshot() throws -> Data {
+        let url = directory.appendingPathComponent("journal.jsonl")
+        guard FileManager.default.fileExists(atPath: url.path) else { return Data() }
+        return try Data(contentsOf: url)
+    }
+
     func journalEntries() throws -> [FakeBacklightJournalEntry] {
         try FileBackedFakeBacklightDevice(directory: directory).journalEntries()
     }
@@ -214,6 +224,29 @@ final class ProcessScenario {
             usleep(5_000)
         }
         throw scenarioError("Timed out waiting for journal event")
+    }
+
+    func waitForHangBarrier(
+        stage: BacklightStage,
+        requestID: BacklightRequestID
+    ) throws {
+        while ContinuousClock.now < deadline {
+            let barrier = try FileBackedFakeBacklightDevice(
+                directory: deviceDirectory
+            ).hangBarrier(for: stage)
+            if let barrier, barrier.requestID == requestID {
+                let entries = try journalEntries()
+                recordOwnedProcesses(from: entries)
+                try recordAncestry(of: barrier.processID)
+                guard let identity = ownedProcesses[barrier.processID],
+                      !Self.processIsGoneOrReused(identity) else {
+                    throw scenarioError("Writer exited after entering the fault barrier")
+                }
+                return
+            }
+            usleep(5_000)
+        }
+        throw scenarioError("Timed out waiting for \(stage.rawValue) fault barrier")
     }
 
     func signalOwnedRole(_ role: OwnedScenarioRole, _ signal: Int32) throws {

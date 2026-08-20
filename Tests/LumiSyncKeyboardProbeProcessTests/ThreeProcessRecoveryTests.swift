@@ -35,6 +35,64 @@ final class ThreeProcessRecoveryTests: XCTestCase {
         )
     }
 
+    func testInvalidSafetyValuesAreRejectedBeforeDeviceMutation() async throws {
+        let validPayload: [String: Any] = [
+            "version": BacklightRequest.currentVersion,
+            "requestID": ["rawValue": "valid-request"],
+            "operation": ["set": ["_0": ["rawValue": 0.5]]],
+            "deadline": ["remainingNanoseconds": 2_000_000_000]
+        ]
+        let oversizedID = String(repeating: "a", count: 65)
+        let invalidInputs: [(String, Data)] = [
+            ("empty-request-id", try framedJSON(replacing(
+                validPayload, keyPath: ["requestID", "rawValue"], with: ""
+            ))),
+            ("oversized-request-id", try framedJSON(replacing(
+                validPayload, keyPath: ["requestID", "rawValue"], with: oversizedID
+            ))),
+            ("brightness-below-range", try framedJSON(replacing(
+                validPayload, keyPath: ["operation", "set", "_0", "rawValue"], with: -1.0
+            ))),
+            ("brightness-above-range", try framedJSON(replacing(
+                validPayload, keyPath: ["operation", "set", "_0", "rawValue"], with: 2.0
+            ))),
+            ("non-finite-brightness", framed(Data(
+                "{\"version\":1,\"requestID\":{\"rawValue\":\"non-finite\"},\"operation\":{\"set\":{\"_0\":{\"rawValue\":1e999}}},\"deadline\":{\"remainingNanoseconds\":2000000000}}".utf8
+            ))),
+            ("zero-deadline", try framedJSON(replacing(
+                validPayload, keyPath: ["deadline", "remainingNanoseconds"], with: UInt64(0)
+            ))),
+            ("deadline-above-limit", try framedJSON(replacing(
+                validPayload, keyPath: ["deadline", "remainingNanoseconds"], with: UInt64(30_000_000_001)
+            ))),
+            ("maximum-deadline", framed(Data(
+                "{\"version\":1,\"requestID\":{\"rawValue\":\"maximum-deadline\"},\"operation\":{\"set\":{\"_0\":{\"rawValue\":0.5}}},\"deadline\":{\"remainingNanoseconds\":18446744073709551615}}".utf8
+            )))
+        ]
+
+        for (name, input) in invalidInputs {
+            let harness = try ProcessHarness()
+            let stateBefore = try harness.stateSnapshot()
+            let journalBefore = try harness.journalSnapshot()
+
+            let result = await harness.run(input: input, timeout: .seconds(2))
+
+            XCTAssertEqual(result.termination, .exited, name)
+            XCTAssertEqual(result.exitStatus, EX_OK, name)
+            XCTAssertTrue(result.cleanupVerified, name)
+            XCTAssertLessThanOrEqual(result.stdout.count, 64 * 1024, name)
+            XCTAssertLessThanOrEqual(result.stderr.count, 64 * 1024, name)
+            XCTAssertTrue(result.stderr.isEmpty, name)
+            XCTAssertEqual(
+                try FramedJSONCodec().decode(BacklightOperationResult.self, from: result.stdout),
+                .failure(primary: .protocolViolation, restoration: .notRequired),
+                name
+            )
+            XCTAssertEqual(try harness.stateSnapshot(), stateBefore, name)
+            XCTAssertEqual(try harness.journalSnapshot(), journalBefore, name)
+        }
+    }
+
     func testMalformedProtocolIsRejectedWithoutLeakingProcesses() async throws {
         let validHarness = try ProcessHarness()
         let request = try validHarness.makeRequest(
@@ -104,6 +162,26 @@ final class ThreeProcessRecoveryTests: XCTestCase {
         }
         XCTAssertEqual(try extraOutputHarness.currentValue(), try NormalizedBacklightValue(0.37))
         XCTAssertTrue(try extraOutputHarness.journalEntries().filter { $0.processRole == .writer }.isEmpty)
+    }
+
+    private func replacing(
+        _ object: [String: Any],
+        keyPath: [String],
+        with value: Any
+    ) -> [String: Any] {
+        guard let key = keyPath.first else { return object }
+        var copy = object
+        if keyPath.count == 1 {
+            copy[key] = value
+            return copy
+        }
+        let nested = copy[key] as? [String: Any] ?? [:]
+        copy[key] = replacing(
+            nested,
+            keyPath: Array(keyPath.dropFirst()),
+            with: value
+        )
+        return copy
     }
 
     private func framed(_ payload: Data) -> Data {
@@ -265,9 +343,10 @@ final class ThreeProcessRecoveryTests: XCTestCase {
                 outerTimeout: .seconds(5)
             )
 
-            try scenario.waitForJournalEvent {
-                $0.processRole == .writer && $0.operationCategory == .set
-            }
+            try scenario.waitForHangBarrier(
+                stage: .writeReadback,
+                requestID: request.requestID
+            )
             try scenario.signalOwnedRole(.controller, signal)
             let result = try scenario.finish()
 
@@ -298,9 +377,10 @@ final class ThreeProcessRecoveryTests: XCTestCase {
                 outerTimeout: .seconds(5)
             )
 
-            try scenario.waitForJournalEvent {
-                $0.processRole == .writer && $0.operationCategory == .set
-            }
+            try scenario.waitForHangBarrier(
+                stage: .writeReadback,
+                requestID: request.requestID
+            )
             try scenario.signalOwnedRole(.writer, signal)
             let result = try scenario.finish()
 
