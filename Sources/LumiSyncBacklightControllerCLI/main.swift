@@ -14,10 +14,12 @@ func emit(_ result: BacklightOperationResult) -> Never {
     }
 }
 
-let input = FileHandle.standardInput.readDataToEndOfFile()
 let request: BacklightRequest
 do {
-    request = try codec.decode(BacklightRequest.self, from: input)
+    request = try FramedJSONReader().read(
+        BacklightRequest.self,
+        from: .standardInput
+    )
 } catch {
     emit(.failure(primary: .protocolViolation, restoration: .notRequired))
 }

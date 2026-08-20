@@ -71,6 +71,59 @@ final class FramedJSONTests: XCTestCase {
             XCTAssertEqual(error as? FramedJSONError, .oversized)
         }
     }
+
+    func testReaderCompletesOneFrameWithoutWaitingForEOF() throws {
+        let pipe = Pipe()
+        let request = try makeReadRequest()
+        try pipe.fileHandleForWriting.write(contentsOf: FramedJSONCodec().encode(request))
+        defer { try? pipe.fileHandleForWriting.close() }
+
+        let started = ContinuousClock.now
+        let decoded = try FramedJSONReader().read(
+            BacklightRequest.self,
+            from: pipe.fileHandleForReading,
+            timeout: .milliseconds(250)
+        )
+
+        XCTAssertEqual(decoded, request)
+        XCTAssertLessThan(started.duration(to: .now), .milliseconds(250))
+    }
+
+    func testReaderRejectsOversizedHeaderBeforeEOF() throws {
+        let pipe = Pipe()
+        try pipe.fileHandleForWriting.write(contentsOf: Data([0, 0, 64, 1]))
+        defer { try? pipe.fileHandleForWriting.close() }
+
+        let started = ContinuousClock.now
+        XCTAssertThrowsError(
+            try FramedJSONReader().read(
+                BacklightRequest.self,
+                from: pipe.fileHandleForReading,
+                timeout: .milliseconds(250)
+            )
+        ) { error in
+            XCTAssertEqual(error as? FramedJSONError, .oversized)
+        }
+        XCTAssertLessThan(started.duration(to: .now), .milliseconds(250))
+    }
+
+    func testReaderRejectsTrailingByteWithoutWaitingForEOF() throws {
+        let pipe = Pipe()
+        var input = try FramedJSONCodec().encode(try makeReadRequest())
+        input.append(0)
+        try pipe.fileHandleForWriting.write(contentsOf: input)
+        defer { try? pipe.fileHandleForWriting.close() }
+
+        XCTAssertThrowsError(
+            try FramedJSONReader().read(
+                BacklightRequest.self,
+                from: pipe.fileHandleForReading,
+                timeout: .milliseconds(250)
+            )
+        ) { error in
+            XCTAssertEqual(error as? FramedJSONError, .trailingBytes)
+        }
+    }
 }
 
 private extension FramedJSONTests {
