@@ -22,6 +22,29 @@ final class BoundedProcessTests: XCTestCase {
         XCTAssertTrue(result.cleanupVerified)
     }
 
+    func testRunnerResetsInheritedIgnoredTerminationSignals() async {
+        let previousINT = Darwin.signal(SIGINT, SIG_IGN)
+        let previousTERM = Darwin.signal(SIGTERM, SIG_IGN)
+        let previousABRT = Darwin.signal(SIGABRT, SIG_IGN)
+        defer {
+            _ = Darwin.signal(SIGINT, previousINT)
+            _ = Darwin.signal(SIGTERM, previousTERM)
+            _ = Darwin.signal(SIGABRT, previousABRT)
+        }
+
+        for signal in [SIGINT, SIGTERM, SIGABRT] {
+            let result = await runner.run(
+                fixture(
+                    command: "kill -\(signal) $$; sleep 30",
+                    timeout: .milliseconds(250)
+                )
+            )
+
+            XCTAssertEqual(result.termination, .signaled(signal), "signal=\(signal)")
+            XCTAssertTrue(result.cleanupVerified, "signal=\(signal)")
+        }
+    }
+
     func testRunnerKillsProcessGroupAtMonotonicDeadline() async {
         let result = await runner.run(
             fixture(command: "sleep 30", timeout: .milliseconds(100))

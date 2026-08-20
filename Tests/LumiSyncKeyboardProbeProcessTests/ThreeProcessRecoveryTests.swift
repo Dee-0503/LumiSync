@@ -3,7 +3,7 @@ import Foundation
 import XCTest
 @testable import LumiSyncKeyboardProbe
 
-final class LumiSyncKeyboardProbeProcessTests: XCTestCase {
+final class ThreeProcessRecoveryTests: XCTestCase {
     func testSetRequestTraversesControllerSupervisorWriterAndReturnsReadback() async throws {
         let harness = try ProcessHarness(initialValue: 0.37)
         let request = try harness.makeRequest(
@@ -45,83 +45,157 @@ final class LumiSyncKeyboardProbeProcessTests: XCTestCase {
         )
         XCTAssertEqual(try harness.currentValue(), try NormalizedBacklightValue(0.37))
     }
-}
 
-private struct ProcessResult {
-    let termination: OwnedProcessTermination
-    let stdout: Data
-    let stderr: Data
-}
-
-private final class ProcessHarness {
-    private let directory: URL
-    private let controllerURL: URL
-    private let supervisorURL: URL
-    private let writerURL: URL
-
-    init(initialValue: Double = 0.37) throws {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("LumiSyncProcessTest-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
-        self.directory = directory
-        controllerURL = try Self.executable(named: "lumisync-backlight-controller")
-        supervisorURL = try Self.executable(named: "lumisync-backlight-supervisor")
-        writerURL = try Self.executable(named: "lumisync-backlight-writer")
-        try FileBackedFakeBacklightDevice.create(
-            directory: directory,
-            configuration: FakeBacklightDeviceConfiguration(initialValue: try NormalizedBacklightValue(initialValue))
-        )
-    }
-
-    deinit {
-        try? FileManager.default.removeItem(at: directory)
-    }
-
-    func run(input: Data, timeout: Duration) async -> ProcessResult {
-        let result = await BoundedOwnedProcessRunner().run(
-            OwnedProcessRequest(
-                executableURL: controllerURL,
-                standardInput: input,
-                timeout: timeout,
-                environment: [
-                    "LUMISYNC_H1_SUPERVISOR_PATH": supervisorURL.path,
-                    "LUMISYNC_H1_WRITER_PATH": writerURL.path,
-                    "LUMISYNC_H1_FAKE_DEVICE_DIR": directory.path
-                ]
+    func testStageTimeoutMatrixIsContainedAndReportsRestorationCertainty() throws {
+        for stage in [
+            BacklightStage.captureOriginal,
+            .write,
+            .writeReadback,
+            .restore,
+            .restoreReadback
+        ] {
+            let harness = try ProcessHarness(initialValue: 0.37, pausedAt: stage)
+            let request = try harness.makeRequest(
+                requestID: "stage-timeout-\(stage.rawValue)",
+                operation: .set(try NormalizedBacklightValue(0.5)),
+                deadlineNanoseconds: 1_500_000_000
             )
-        )
-        return ProcessResult(termination: result.termination, stdout: result.stdout, stderr: result.stderr)
-    }
+            let started = ContinuousClock.now
+            let scenario = try harness.startScenario(
+                input: try FramedJSONCodec().encode(request),
+                outerTimeout: .seconds(5)
+            )
 
-    func currentValue() throws -> NormalizedBacklightValue {
-        try FileBackedFakeBacklightDevice(directory: directory).read(
-            requestID: try BacklightRequestID(rawValue: "harness-read")
-        )
-    }
+            let processResult = try scenario.finish()
+            let elapsed = started.duration(to: .now)
+            XCTAssertLessThan(elapsed, .seconds(5), "stage=\(stage.rawValue)")
+            XCTAssertEqual(processResult.termination, .exited, "stage=\(stage.rawValue)")
+            let result = try FramedJSONCodec().decode(
+                BacklightOperationResult.self,
+                from: processResult.stdout
+            )
+            let entries = try scenario.journalEntries()
+                .filter { $0.processRole == .writer }
 
-    func makeRequest(requestID: String, operation: BacklightOperation) throws -> BacklightRequest {
-        BacklightRequest(
-            requestID: try BacklightRequestID(rawValue: requestID),
-            operation: operation,
-            deadline: try BacklightDeadline(remainingNanoseconds: 2_000_000_000)
-        )
-    }
-
-    func journalEntries() throws -> [FakeBacklightJournalEntry] {
-        try FileBackedFakeBacklightDevice(directory: directory).journalEntries()
-    }
-
-    private static func executable(named name: String) throws -> URL {
-        var base = Bundle(for: LumiSyncKeyboardProbeProcessTests.self).bundleURL
-        for _ in 0..<5 {
-            let candidate = base.deletingLastPathComponent().appendingPathComponent(name)
-            if FileManager.default.isExecutableFile(atPath: candidate.path) {
-                return candidate
+            switch stage {
+            case .captureOriginal:
+                XCTAssertEqual(
+                    result,
+                    .failure(
+                        primary: .timedOut(stage: .captureOriginal),
+                        restoration: .notRequired
+                    )
+                )
+                XCTAssertFalse(entries.contains { $0.operationCategory == .set })
+                XCTAssertFalse(entries.contains { $0.operationCategory == .restore })
+                XCTAssertEqual(try scenario.currentValue(), try NormalizedBacklightValue(0.37))
+            case .write:
+                XCTAssertEqual(
+                    result,
+                    .failure(
+                        primary: .timedOut(stage: .write),
+                        restoration: .verified(try NormalizedBacklightValue(0.37))
+                    )
+                )
+                XCTAssertFalse(entries.contains { $0.operationCategory == .set })
+                XCTAssertTrue(entries.contains { $0.operationCategory == .restore })
+                XCTAssertEqual(try scenario.currentValue(), try NormalizedBacklightValue(0.37))
+            case .writeReadback:
+                XCTAssertEqual(
+                    result,
+                    .failure(
+                        primary: .timedOut(stage: .writeReadback),
+                        restoration: .verified(try NormalizedBacklightValue(0.37))
+                    )
+                )
+                XCTAssertTrue(entries.contains { $0.operationCategory == .set })
+                XCTAssertTrue(entries.contains { $0.operationCategory == .restore })
+                XCTAssertEqual(try scenario.currentValue(), try NormalizedBacklightValue(0.37))
+            case .restore:
+                XCTAssertEqual(
+                    result,
+                    .failure(primary: .restorationFailed, restoration: .failed)
+                )
+                XCTAssertFalse(entries.contains { $0.operationCategory == .restore })
+                XCTAssertEqual(try scenario.currentValue(), try NormalizedBacklightValue(0.5))
+            case .restoreReadback:
+                XCTAssertEqual(
+                    result,
+                    .failure(primary: .restorationUncertain, restoration: .uncertain)
+                )
+                XCTAssertTrue(entries.contains { $0.operationCategory == .restore })
+                XCTAssertEqual(try scenario.currentValue(), try NormalizedBacklightValue(0.37))
             }
-            base = base.deletingLastPathComponent()
+            try scenario.assertNoOwnedProcessesRemain()
         }
-        throw NSError(domain: "LumiSyncKeyboardProbeProcessTests", code: 1, userInfo: [
-            NSLocalizedDescriptionKey: "Unable to locate SwiftPM product \(name)"
-        ])
+    }
+
+    func testControllerSignalsLeaveSupervisorToRestoreOriginalValue() throws {
+        for signal in [SIGINT, SIGTERM, SIGABRT, SIGKILL] {
+            let harness = try ProcessHarness(initialValue: 0.37, pausedAt: .writeReadback)
+            let request = try harness.makeRequest(
+                requestID: "controller-signal-\(signal)",
+                operation: .set(try NormalizedBacklightValue(0.5))
+            )
+            let scenario = try harness.startScenario(
+                input: try FramedJSONCodec().encode(request),
+                outerTimeout: .seconds(5)
+            )
+
+            try scenario.waitForJournalEvent {
+                $0.processRole == .writer && $0.operationCategory == .set
+            }
+            try scenario.signalOwnedRole(.controller, signal)
+            let result = try scenario.finish()
+
+            XCTAssertEqual(result.termination, .signaled(signal), "signal=\(signal)")
+            XCTAssertEqual(
+                try scenario.currentValue(),
+                try NormalizedBacklightValue(0.37),
+                "signal=\(signal)"
+            )
+            let operationCategories = try scenario.journalEntries()
+                .filter { $0.processRole == .writer }
+                .map(\.operationCategory)
+            XCTAssertTrue(operationCategories.contains(.restore), "signal=\(signal)")
+            XCTAssertEqual(operationCategories.last, .read, "signal=\(signal)")
+            try scenario.assertNoOwnedProcessesRemain()
+        }
+    }
+
+    func testWriterSignalsRestoreOriginalValue() throws {
+        for signal in [SIGINT, SIGTERM, SIGABRT, SIGKILL] {
+            let harness = try ProcessHarness(initialValue: 0.37, pausedAt: .writeReadback)
+            let request = try harness.makeRequest(
+                requestID: "writer-signal-\(signal)",
+                operation: .set(try NormalizedBacklightValue(0.5))
+            )
+            let scenario = try harness.startScenario(
+                input: try FramedJSONCodec().encode(request),
+                outerTimeout: .seconds(5)
+            )
+
+            try scenario.waitForJournalEvent {
+                $0.processRole == .writer && $0.operationCategory == .set
+            }
+            try scenario.signalOwnedRole(.writer, signal)
+            let result = try scenario.finish()
+
+            XCTAssertEqual(result.termination, .exited, "signal=\(signal)")
+            XCTAssertEqual(
+                try FramedJSONCodec().decode(BacklightOperationResult.self, from: result.stdout),
+                .failure(
+                    primary: .writerFailed,
+                    restoration: .verified(try NormalizedBacklightValue(0.37))
+                ),
+                "signal=\(signal)"
+            )
+            XCTAssertEqual(
+                try scenario.currentValue(),
+                try NormalizedBacklightValue(0.37),
+                "signal=\(signal)"
+            )
+            try scenario.assertNoOwnedProcessesRemain()
+        }
     }
 }

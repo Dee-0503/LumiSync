@@ -4,149 +4,274 @@ public struct BacklightSupervisorConfiguration: Sendable {
     public let writerExecutableURL: URL
     public let fakeDeviceDirectory: URL
     public let readbackTolerance: Double
-    public let stageDuration: Duration
 
     public init(
         writerExecutableURL: URL,
         fakeDeviceDirectory: URL,
-        readbackTolerance: Double = 0.01,
-        stageDuration: Duration = .seconds(1)
+        readbackTolerance: Double = 0.01
     ) {
         self.writerExecutableURL = writerExecutableURL
         self.fakeDeviceDirectory = fakeDeviceDirectory
         self.readbackTolerance = readbackTolerance
-        self.stageDuration = stageDuration
     }
 }
 
 public actor BacklightSafetySupervisor {
-    private let runner: any OwnedProcessRunning
-    private let configuration: BacklightSupervisorConfiguration
-    private let codec = FramedJSONCodec()
+    private struct StageExecution {
+        let result: BacklightOperationResult
+        let timedOut: Bool
+    }
 
-    public init(
-        runner: any OwnedProcessRunning,
-        configuration: BacklightSupervisorConfiguration
-    ) {
+    private static let maximumChildNanoseconds: UInt64 = 500_000_000
+
+    private let runner: OwnedProcessRunning
+    private let configuration: BacklightSupervisorConfiguration
+
+    public init(runner: OwnedProcessRunning, configuration: BacklightSupervisorConfiguration) {
         self.runner = runner
         self.configuration = configuration
     }
 
     public func execute(_ request: BacklightRequest) async -> BacklightOperationResult {
-        guard case .read = request.operation else {
-            return await executeMutation(request)
-        }
-        return await executeRead(request)
-    }
-
-    private func executeRead(_ request: BacklightRequest) async -> BacklightOperationResult {
-        do {
-            let result = try await run(request)
-            guard case .success(let readback) = result else {
-                return .failure(primary: .writerFailed, restoration: .notRequired)
-            }
-            return .success(readback: readback)
-        } catch {
-            return .failure(primary: .protocolViolation, restoration: .notRequired)
-        }
-    }
-
-    private func executeMutation(_ request: BacklightRequest) async -> BacklightOperationResult {
-        let original: NormalizedBacklightValue
-        do {
-            let capture = try await run(
-                BacklightRequest(
-                    requestID: request.requestID,
-                    operation: .read,
-                    deadline: try BacklightDeadline(
-                        remainingNanoseconds: request.deadline.remainingNanoseconds
-                    )
-                )
-            )
-            guard case .success(let readback) = capture else {
-                return .failure(primary: .writerFailed, restoration: .notRequired)
-            }
-            original = readback
-        } catch {
-            return .failure(primary: .timedOut(stage: .captureOriginal), restoration: .notRequired)
-        }
-
-        let mutationResult: BacklightOperationResult
-        do {
-            mutationResult = try await run(request)
-        } catch {
-            mutationResult = .failure(
-                primary: .protocolViolation,
-                restoration: .notRequired
-            )
-        }
-
-        let restoration = await restore(original, requestID: request.requestID)
-        switch restoration {
-        case .verified:
-            switch mutationResult {
-            case .success:
-                return mutationResult
-            case .failure(let primary, _):
-                return .failure(primary: primary, restoration: restoration)
-            }
-        case .failed:
-            return .failure(primary: .restorationFailed, restoration: restoration)
-        case .uncertain:
-            return .failure(primary: .restorationUncertain, restoration: restoration)
-        case .notRequired:
-            return .failure(primary: .protocolViolation, restoration: restoration)
-        }
-    }
-
-    private func restore(
-        _ value: NormalizedBacklightValue,
-        requestID: BacklightRequestID
-    ) async -> RestorationOutcome {
-        do {
-            let request = BacklightRequest(
-                requestID: requestID,
-                operation: .restore(value),
-                deadline: try BacklightDeadline(
-                    remainingNanoseconds: durationNanoseconds(configuration.stageDuration)
-                )
-            )
-            let result = try await run(request)
-            guard case .success(let readback) = result else {
-                return .failed
-            }
-            guard abs(readback.rawValue - value.rawValue) <= configuration.readbackTolerance else {
-                return .uncertain
-            }
-            return .verified(readback)
-        } catch {
-            return .uncertain
-        }
-    }
-
-    private func run(_ request: BacklightRequest) async throws -> BacklightOperationResult {
-        let processRequest = OwnedProcessRequest(
-            executableURL: configuration.writerExecutableURL,
-            standardInput: try codec.encode(request),
-            timeout: configuration.stageDuration
+        let operationDeadline = ContinuousClock.now.advanced(
+            by: .nanoseconds(Int64(request.deadline.remainingNanoseconds))
         )
-        let result = await runner.run(processRequest)
-        guard result.termination == .exited,
-              result.exitStatus == 0,
-              result.cleanupVerified
-        else {
-            throw BacklightSupervisorError.processFailed
+        switch request.operation {
+        case .read:
+            return await perform(
+                request,
+                stage: .captureOriginal,
+                operationDeadline: operationDeadline
+            ).result
+        case .set:
+            let originalRequest = childRequest(
+                from: request,
+                operation: .read,
+                remainingNanoseconds: remainingNanoseconds(until: operationDeadline)
+            )
+            guard let originalRequest else {
+                return .failure(
+                    primary: .timedOut(stage: .captureOriginal),
+                    restoration: .notRequired
+                )
+            }
+            let originalExecution = await perform(
+                originalRequest,
+                stage: .captureOriginal,
+                operationDeadline: operationDeadline
+            )
+            guard case .success(let original) = originalExecution.result else {
+                return originalExecution.result
+            }
+
+            let mutationRequest = childRequest(
+                from: request,
+                operation: request.operation,
+                remainingNanoseconds: remainingNanoseconds(until: operationDeadline)
+            )
+            let mutationExecution: StageExecution
+            if let mutationRequest {
+                mutationExecution = await perform(
+                    mutationRequest,
+                    stage: .write,
+                    operationDeadline: operationDeadline
+                )
+            } else {
+                mutationExecution = StageExecution(
+                    result: .failure(
+                        primary: .timedOut(stage: .write),
+                        restoration: .notRequired
+                    ),
+                    timedOut: true
+                )
+            }
+            let mutationResult = resolvedMutationResult(
+                mutationExecution,
+                requestID: request.requestID
+            )
+
+            let restoreRequest = childRequest(
+                from: request,
+                operation: .restore(original),
+                remainingNanoseconds: remainingNanoseconds(until: operationDeadline)
+            )
+            let restoreExecution: StageExecution
+            if let restoreRequest {
+                restoreExecution = await perform(
+                    restoreRequest,
+                    stage: .restore,
+                    operationDeadline: operationDeadline
+                )
+            } else {
+                restoreExecution = StageExecution(
+                    result: .failure(
+                        primary: .timedOut(stage: .restore),
+                        restoration: .notRequired
+                    ),
+                    timedOut: true
+                )
+            }
+            let restoration = restorationOutcome(
+                from: restoreExecution,
+                original: original,
+                requestID: request.requestID
+            )
+
+            switch mutationResult {
+            case .success(let readback):
+                return restoration == .verified(original)
+                    ? .success(readback: readback)
+                    : .resolvedFailure(primary: nil, restoration: restoration)
+            case .failure(let primary, _):
+                return .resolvedFailure(primary: primary, restoration: restoration)
+            }
+        case .restore:
+            return await perform(
+                request,
+                stage: .restore,
+                operationDeadline: operationDeadline
+            ).result
         }
-        return try codec.decode(BacklightOperationResult.self, from: result.stdout)
     }
 
-    private func durationNanoseconds(_ duration: Duration) -> UInt64 {
-        let components = duration.components
-        return UInt64(max(1, components.seconds)) * 1_000_000_000
-            + UInt64(max(0, components.attoseconds / 1_000_000_000))
+    private func perform(
+        _ request: BacklightRequest,
+        stage: BacklightStage,
+        operationDeadline: ContinuousClock.Instant
+    ) async -> StageExecution {
+        let remaining = remainingNanoseconds(until: operationDeadline)
+        guard remaining > 0 else {
+            return StageExecution(
+                result: .failure(primary: .timedOut(stage: stage), restoration: .notRequired),
+                timedOut: true
+            )
+        }
+        let childNanoseconds = min(remaining, Self.maximumChildNanoseconds)
+        guard let childRequest = childRequest(
+            from: request,
+            operation: request.operation,
+            remainingNanoseconds: childNanoseconds
+        ) else {
+            return StageExecution(
+                result: .failure(primary: .timedOut(stage: stage), restoration: .notRequired),
+                timedOut: true
+            )
+        }
+        let encoded = (try? FramedJSONCodec().encode(childRequest)) ?? Data()
+        let process = await runner.run(
+            OwnedProcessRequest(
+                executableURL: configuration.writerExecutableURL,
+                arguments: [childRequest.operationName, childRequest.operationValue],
+                standardInput: encoded,
+                timeout: .nanoseconds(Int64(childNanoseconds)),
+                environment: [
+                    "LUMISYNC_H1_FAKE_DEVICE_DIR": configuration.fakeDeviceDirectory.path
+                ]
+            )
+        )
+        if process.termination == .timedOut {
+            return StageExecution(
+                result: .failure(primary: .timedOut(stage: stage), restoration: .notRequired),
+                timedOut: true
+            )
+        }
+        guard process.termination == .exited,
+              process.exitStatus == 0,
+              process.cleanupVerified else {
+            return StageExecution(
+                result: .failure(primary: .writerFailed, restoration: .notRequired),
+                timedOut: false
+            )
+        }
+        let result = (try? FramedJSONCodec().decode(
+            BacklightOperationResult.self,
+            from: process.stdout
+        )) ?? .failure(primary: .protocolViolation, restoration: .notRequired)
+        return StageExecution(result: result, timedOut: false)
+    }
+
+    private func resolvedMutationResult(
+        _ execution: StageExecution,
+        requestID: BacklightRequestID
+    ) -> BacklightOperationResult {
+        guard execution.timedOut else { return execution.result }
+        let stage: BacklightStage = journalContains(
+            requestID: requestID,
+            category: .set
+        ) ? .writeReadback : .write
+        return .failure(primary: .timedOut(stage: stage), restoration: .notRequired)
+    }
+
+    private func restorationOutcome(
+        from execution: StageExecution,
+        original: NormalizedBacklightValue,
+        requestID: BacklightRequestID
+    ) -> RestorationOutcome {
+        if execution.timedOut {
+            return journalContains(requestID: requestID, category: .restore)
+                ? .uncertain
+                : .failed
+        }
+        if case .success(let restored) = execution.result,
+           abs(restored.rawValue - original.rawValue) <= configuration.readbackTolerance {
+            return .verified(restored)
+        }
+        return .failed
+    }
+
+    private func journalContains(
+        requestID: BacklightRequestID,
+        category: FakeBacklightOperationCategory
+    ) -> Bool {
+        guard let device = try? FileBackedFakeBacklightDevice(
+            directory: configuration.fakeDeviceDirectory,
+            processRole: .supervisor
+        ),
+        let entries = try? device.journalEntries() else {
+            return false
+        }
+        return entries.contains {
+            $0.requestID == requestID && $0.operationCategory == category
+        }
+    }
+
+    private func childRequest(
+        from request: BacklightRequest,
+        operation: BacklightOperation,
+        remainingNanoseconds: UInt64
+    ) -> BacklightRequest? {
+        guard let deadline = try? BacklightDeadline(
+            remainingNanoseconds: remainingNanoseconds
+        ) else {
+            return nil
+        }
+        return BacklightRequest(
+            requestID: request.requestID,
+            operation: operation,
+            deadline: deadline
+        )
+    }
+
+    private func remainingNanoseconds(
+        until deadline: ContinuousClock.Instant
+    ) -> UInt64 {
+        let remaining = ContinuousClock.now.duration(to: deadline)
+        let components = remaining.components
+        guard components.seconds >= 0, components.attoseconds >= 0 else {
+            return 0
+        }
+        let seconds = UInt64(components.seconds)
+        let nanoseconds = UInt64(components.attoseconds) / 1_000_000_000
+        return seconds.multipliedReportingOverflow(by: 1_000_000_000).partialValue
+            .addingReportingOverflow(nanoseconds).partialValue
     }
 }
 
-private enum BacklightSupervisorError: Error {
-    case processFailed
+private extension BacklightRequest {
+    var operationName: String {
+        switch operation { case .read: return "read"; case .set: return "set"; case .restore: return "restore" }
+    }
+    var operationValue: String {
+        switch operation { case .read: return "0"; case .set(let value), .restore(let value): return String(value.rawValue) }
+    }
 }

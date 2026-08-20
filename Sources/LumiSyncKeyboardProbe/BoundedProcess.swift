@@ -216,7 +216,19 @@ private final class SpawnedProcess: @unchecked Sendable {
         var attributes: posix_spawnattr_t?
         posix_spawnattr_init(&attributes)
         defer { posix_spawnattr_destroy(&attributes) }
-        posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP))
+        var defaultSignals = sigset_t()
+        sigemptyset(&defaultSignals)
+        for signal in [SIGINT, SIGTERM, SIGABRT] {
+            sigaddset(&defaultSignals, signal)
+        }
+        var signalMask = sigset_t()
+        sigemptyset(&signalMask)
+        posix_spawnattr_setsigdefault(&attributes, &defaultSignals)
+        posix_spawnattr_setsigmask(&attributes, &signalMask)
+        posix_spawnattr_setflags(
+            &attributes,
+            Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK)
+        )
         posix_spawnattr_setpgroup(&attributes, 0)
 
         var argv = [UnsafeMutablePointer<CChar>?](repeating: nil, count: request.arguments.count + 2)

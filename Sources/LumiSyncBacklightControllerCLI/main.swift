@@ -36,7 +36,7 @@ let process = await BoundedOwnedProcessRunner().run(
     OwnedProcessRequest(
         executableURL: URL(fileURLWithPath: supervisorPath),
         standardInput: try codec.encode(request),
-        timeout: .seconds(5),
+        timeout: .nanoseconds(Int64(request.deadline.remainingNanoseconds)),
         environment: [
             "LUMISYNC_H1_WRITER_PATH": writerPath,
             "LUMISYNC_H1_FAKE_DEVICE_DIR": directoryPath

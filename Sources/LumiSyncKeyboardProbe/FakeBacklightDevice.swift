@@ -16,6 +16,7 @@ public enum FakeBacklightFaultAction: Codable, Equatable, Sendable {
     case sleepNanoseconds(UInt64)
     case exit(code: Int32)
     case raise(signal: Int32)
+    case hang(stage: BacklightStage)
     case malformedOutput
     case forkSleepingChild
     case attemptSetsid
@@ -168,16 +169,33 @@ public final class FileBackedFakeBacklightDevice {
     }
 
     public func consumeFault() throws -> FakeBacklightFaultAction? {
+        try consumeFault(matching: nil)
+    }
+
+    public func consumeFault(
+        for stage: BacklightStage
+    ) throws -> FakeBacklightFaultAction? {
+        try consumeFault(matching: stage)
+    }
+
+    private func consumeFault(
+        matching stage: BacklightStage?
+    ) throws -> FakeBacklightFaultAction? {
         try withLock {
             let data = try readBoundedFile(
                 faultsURL,
                 maximumBytes: Self.maximumFaultFileBytes
             )
             var actions = try JSONDecoder().decode([FakeBacklightFaultAction].self, from: data)
-            guard !actions.isEmpty else {
+            guard let action = actions.first else {
                 return nil
             }
-            let action = actions.removeFirst()
+            if case .hang(let expectedStage) = action,
+               let stage,
+               expectedStage != stage {
+                return nil
+            }
+            actions.removeFirst()
             let replacement = try JSONEncoder().encode(actions)
             guard replacement.count <= Self.maximumFaultFileBytes else {
                 throw FakeBacklightDeviceError.oversizedFile(faultsURL.lastPathComponent)
