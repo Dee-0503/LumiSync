@@ -304,6 +304,15 @@ def validate_bundle(
     if str(found_build) != build_number:
         errors.append(f"CFBundleVersion must be {build_number}, found {found_build}")
 
+    bundle_executable = info.get("CFBundleExecutable")
+    if not isinstance(bundle_executable, str) or not bundle_executable:
+        errors.append("CFBundleExecutable must name the app executable")
+    else:
+        required_app_path = f"Contents/MacOS/{bundle_executable}"
+        app_entry = next(entry for entry in entries if entry["role"] == "app")
+        if app_entry["path"] != required_app_path:
+            errors.append(f"app executable must match CFBundleExecutable: {required_app_path}")
+
     icon_name = info.get("CFBundleIconFile")
     if not isinstance(icon_name, str) or not icon_name:
         errors.append("CFBundleIconFile must name an icon resource")

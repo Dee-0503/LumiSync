@@ -72,6 +72,23 @@ final class ReleaseBundleFixtureTests: XCTestCase {
         XCTAssertTrue(result.output.contains("forbidden dependency or rpath string '.build'"))
     }
 
+    func testRejectsBundleExecutableThatDoesNotMatchAppRole() throws {
+        let fixture = try makeValidFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        try updateInfoPlist(at: fixture.app) { plist in
+            plist["CFBundleExecutable"] = "NotLumiSync"
+        }
+
+        let result = try runVerifier(app: fixture.app, manifest: fixture.manifest)
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(
+            result.output.contains("app executable must match CFBundleExecutable: Contents/MacOS/NotLumiSync"),
+            result.output
+        )
+    }
+
     func testRejectsUnexpectedNonExecutableFileInCodeDirectories() throws {
         let fixture = try makeValidFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -425,6 +442,20 @@ final class ReleaseBundleFixtureTests: XCTestCase {
         try (manifest ?? validManifest).write(to: manifestURL, atomically: true, encoding: .utf8)
 
         return (root, app, manifestURL)
+    }
+
+    private func updateInfoPlist(at app: URL, update: (inout [String: Any]) -> Void) throws {
+        let plistURL = app.appendingPathComponent("Contents/Info.plist")
+        var plist = try XCTUnwrap(
+            PropertyListSerialization.propertyList(
+                from: Data(contentsOf: plistURL),
+                options: [],
+                format: nil
+            ) as? [String: Any]
+        )
+        update(&plist)
+        let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+        try data.write(to: plistURL)
     }
 
     private func writeExecutable(at url: URL, marker: String = "MOCK_MACHO_ARCH=arm64\n") throws {
