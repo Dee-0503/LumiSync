@@ -1,8 +1,8 @@
 # Safe Backlight Control and Distribution Design
 
-**Date:** 2026-08-17  
-**Status:** Approved  
-**Project:** LumiSync  
+**Date:** 2026-08-17
+**Status:** Approved
+**Project:** LumiSync
 **Extends:** `docs/superpowers/specs/2026-08-04-lumisync-design.md`
 
 ## 1. Purpose
