@@ -34,15 +34,24 @@ guard let supervisorPath = environment["LUMISYNC_H1_SUPERVISOR_PATH"],
     emit(.failure(primary: .rejected, restoration: .notRequired))
 }
 
+let supervisorTimeoutNanoseconds = request.deadline.remainingNanoseconds.addingReportingOverflow(
+    BacklightSafetySupervisor.recoveryBudgetNanoseconds
+)
+guard !supervisorTimeoutNanoseconds.overflow,
+      supervisorTimeoutNanoseconds.partialValue <= UInt64(Int64.max) else {
+    emit(.failure(primary: .rejected, restoration: .notRequired))
+}
+
 let process = await BoundedOwnedProcessRunner().run(
     OwnedProcessRequest(
         executableURL: URL(fileURLWithPath: supervisorPath),
         standardInput: try codec.encode(request),
-        timeout: .nanoseconds(Int64(request.deadline.remainingNanoseconds)),
+        timeout: .nanoseconds(Int64(supervisorTimeoutNanoseconds.partialValue)),
         environment: [
             "LUMISYNC_H1_WRITER_PATH": writerPath,
             "LUMISYNC_H1_FAKE_DEVICE_DIR": directoryPath
-        ]
+        ],
+        descendantPolicy: .executableContractNoDescendants
     )
 )
 

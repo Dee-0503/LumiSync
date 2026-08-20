@@ -341,9 +341,7 @@ final class BoundedProcessTests: XCTestCase {
         )
 
         let elapsed = started.duration(to: .now)
-        let escapedPID = try XCTUnwrap(
-            Int32(try String(contentsOf: pidFile, encoding: .utf8))
-        )
+        let escapedPID = try XCTUnwrap(waitForPID(in: pidFile))
         defer {
             _ = kill(escapedPID, SIGKILL)
             _ = waitUntilGone(escapedPID)

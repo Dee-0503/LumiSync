@@ -28,6 +28,8 @@ public actor BacklightSafetySupervisor {
         let timedOut: Bool
     }
 
+    public static let recoveryBudgetNanoseconds: UInt64 = 1_000_000_000
+
     private static let maximumChildNanoseconds: UInt64 = 500_000_000
 
     private let runner: OwnedProcessRunning
@@ -97,17 +99,20 @@ public actor BacklightSafetySupervisor {
                 requestID: request.requestID
             )
 
+            let recoveryDeadline = ContinuousClock.now.advanced(
+                by: .nanoseconds(Int64(Self.recoveryBudgetNanoseconds))
+            )
             let restoreRequest = childRequest(
                 from: request,
                 operation: .restore(original),
-                remainingNanoseconds: remainingNanoseconds(until: operationDeadline)
+                remainingNanoseconds: remainingNanoseconds(until: recoveryDeadline)
             )
             let restoreExecution: StageExecution
             if let restoreRequest {
                 restoreExecution = await perform(
                     restoreRequest,
                     stage: .restore,
-                    operationDeadline: operationDeadline
+                    operationDeadline: recoveryDeadline
                 )
             } else {
                 restoreExecution = StageExecution(
