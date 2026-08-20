@@ -196,7 +196,58 @@ def verify_master(path: Path) -> None:
         raise VerificationError(f"{path}: master PNG center must be non-transparent")
 
 
-def verify_icns(path: Path) -> None:
+def expected_iconset_from_master(master: Path, temporary: Path) -> Path:
+    source_iconset = temporary / "expected-source.iconset"
+    expected_icns = temporary / "expected.icns"
+    expected_iconset = temporary / "expected.iconset"
+    source_iconset.mkdir()
+    for name, size in REQUIRED_ICNS_REPRESENTATIONS.items():
+        output = source_iconset / name
+        result = subprocess.run(
+            ["sips", "-z", str(size), str(size), str(master), "--out", str(output)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            diagnostic = result.stderr.strip() or result.stdout.strip() or "unknown sips error"
+            raise VerificationError(f"{master}: sips scaling failed for {name}: {diagnostic}")
+    result = subprocess.run(
+        ["iconutil", "-c", "icns", str(source_iconset), "-o", str(expected_icns)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        diagnostic = result.stderr.strip() or result.stdout.strip() or "unknown iconutil error"
+        raise VerificationError(f"{master}: iconutil packaging failed: {diagnostic}")
+    result = subprocess.run(
+        ["iconutil", "-c", "iconset", str(expected_icns), "-o", str(expected_iconset)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        diagnostic = result.stderr.strip() or result.stdout.strip() or "unknown iconutil error"
+        raise VerificationError(f"{master}: iconutil extraction failed: {diagnostic}")
+    return expected_iconset
+
+
+def compare_icns_representation(
+    icns: Path,
+    representation: Path,
+    expected: Path,
+    name: str,
+) -> None:
+    expected_width, expected_height, expected_rows = parse_png(expected, decode_pixels=True)
+    actual_width, actual_height, actual_rows = parse_png(representation, decode_pixels=True)
+    if (actual_width, actual_height) != (expected_width, expected_height) or actual_rows != expected_rows:
+        raise VerificationError(
+            f"{icns}: ICNS representation {name} does not match master scaled with sips"
+        )
+
+
+def verify_icns(path: Path, master: Path) -> None:
     if shutil.which("iconutil") is None:
         raise VerificationError("iconutil is required to verify ICNS representations")
     try:
@@ -229,6 +280,10 @@ def verify_icns(path: Path) -> None:
                 raise VerificationError(
                     f"{path}: unexpected ICNS representation files: {', '.join(unexpected)}"
                 )
+            expected_iconset = expected_iconset_from_master(master, temporary)
+            expected_representations = {
+                representation.name: representation for representation in expected_iconset.glob("*.png")
+            }
             for name, representation in sorted(representations.items()):
                 width, height, _ = parse_png(representation, decode_pixels=False)
                 if width != height:
@@ -239,6 +294,7 @@ def verify_icns(path: Path) -> None:
                         f"{path}: ICNS representation {name} must be "
                         f"{expected_size}x{expected_size}, got {width}x{height}"
                     )
+                compare_icns_representation(path, representation, expected_representations[name], name)
     except OSError as error:
         raise VerificationError(f"cannot verify ICNS {path}: {error}") from error
 
@@ -254,7 +310,7 @@ def main() -> int:
     arguments = parse_arguments()
     try:
         verify_master(arguments.master)
-        verify_icns(arguments.icns)
+        verify_icns(arguments.icns, arguments.master)
     except VerificationError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

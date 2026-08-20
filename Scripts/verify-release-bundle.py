@@ -12,7 +12,8 @@ import sys
 from pathlib import Path, PurePosixPath
 
 FORBIDDEN_STRINGS = (".build", "/Users/", "/private/tmp/")
-EXECUTABLE_DIRECTORIES = ("Contents/MacOS", "Contents/Helpers")
+CODE_ROOT_DIRECTORIES = ("Contents/MacOS", "Contents/Helpers", "Contents/Frameworks", "Contents/PlugIns", "Contents/XPCServices")
+BUNDLE_SUFFIXES = (".app", ".appex", ".xpc", ".framework", ".bundle")
 MOCK_ARCH_PREFIX = "MOCK_MACHO_ARCH="
 MOCK_DEPENDENCY_PREFIX = "MOCK_DEPENDENCY="
 MOCK_RPATH_PREFIX = "MOCK_RPATH="
@@ -57,8 +58,8 @@ def load_manifest(path: Path) -> list[dict[str, str]]:
             raise ManifestError(f"duplicate executable path: {path_value}")
         if entry["role"] in roles:
             raise ManifestError(f"duplicate executable role: {entry['role']}")
-        if len(manifest_path.parts) != 3 or "/".join(manifest_path.parts[:2]) not in EXECUTABLE_DIRECTORIES:
-            raise ManifestError(f"executable path must be under Contents/MacOS or Contents/Helpers: {path_value}")
+        if len(manifest_path.parts) < 3 or manifest_path.parts[0] != "Contents":
+            raise ManifestError(f"executable path must be under Contents: {path_value}")
 
         paths.add(path_value)
         roles.add(entry["role"])
@@ -136,22 +137,41 @@ def first_symlink_component(app: Path, relative: str) -> str | None:
     return None
 
 
-def find_code_directory_errors(app: Path, expected: set[str]) -> list[str]:
+def code_roots(app: Path) -> list[Path]:
+    roots = [app / directory for directory in CODE_ROOT_DIRECTORIES]
+    for path in app.rglob("*"):
+        try:
+            mode = path.lstat().st_mode
+        except OSError:
+            continue
+        if stat.S_ISDIR(mode) and path.suffix in BUNDLE_SUFFIXES:
+            roots.append(path)
+    return roots
+
+
+def find_code_path_errors(app: Path, expected: set[str]) -> list[str]:
     errors: list[str] = []
-    for directory in EXECUTABLE_DIRECTORIES:
-        root = app / directory
+    seen: set[Path] = set()
+    strict_roots = {app / "Contents/MacOS", app / "Contents/Helpers"}
+    for root in code_roots(app):
+        if root in seen:
+            continue
+        seen.add(root)
+        relative_root = root.relative_to(app).as_posix()
         try:
             root_mode = root.lstat().st_mode
         except FileNotFoundError:
             continue
         except OSError as error:
-            errors.append(f"cannot inspect code path {directory}: {error}")
+            errors.append(f"cannot inspect code path {relative_root}: {error}")
             continue
         if root_mode & 0o022:
-            errors.append(f"group/world-writable code path: {directory}")
+            errors.append(f"group/world-writable code path: {relative_root}")
+        if stat.S_ISLNK(root_mode):
+            errors.append(f"unexpected symlink in code path: {relative_root}")
+            continue
         if not stat.S_ISDIR(root_mode):
             continue
-
         for child in root.rglob("*"):
             relative = child.relative_to(app).as_posix()
             try:
@@ -163,9 +183,31 @@ def find_code_directory_errors(app: Path, expected: set[str]) -> list[str]:
                 errors.append(f"group/world-writable code path: {relative}")
             if stat.S_ISLNK(mode):
                 errors.append(f"unexpected symlink in code path: {relative}")
-            elif stat.S_ISREG(mode) and relative not in expected:
+            elif root in strict_roots and stat.S_ISREG(mode) and relative not in expected:
                 errors.append(f"unexpected executable: {relative}")
     return errors
+
+
+def discover_macho_objects(app: Path, allow_mock: bool) -> tuple[list[tuple[str, Path]], list[str]]:
+    objects: list[tuple[str, Path]] = []
+    errors: list[str] = []
+    for candidate in app.rglob("*"):
+        relative = candidate.relative_to(app).as_posix()
+        try:
+            mode = candidate.lstat().st_mode
+        except OSError as error:
+            errors.append(f"cannot inspect code path {relative}: {error}")
+            continue
+        if not stat.S_ISREG(mode):
+            continue
+        try:
+            architecture, _ = macho_metadata(candidate, allow_mock, relative)
+        except ValueError as error:
+            errors.append(f"{error} ({relative})")
+            continue
+        if architecture is not None:
+            objects.append((relative, candidate))
+    return objects, errors
 
 
 def validate_bundle(
@@ -185,7 +227,7 @@ def validate_bundle(
         return [f"app bundle is missing: {app}"]
 
     expected = {entry["path"] for entry in entries}
-    errors.extend(find_code_directory_errors(app, expected))
+    errors.extend(find_code_path_errors(app, expected))
 
     existing_executables: list[tuple[str, Path]] = []
     for entry in entries:
@@ -218,6 +260,15 @@ def validate_bundle(
         if mode & 0o022:
             errors.append(f"group/world-writable executable: {relative}")
         existing_executables.append((relative, executable))
+
+    discovered_macho, discovery_errors = discover_macho_objects(app, allow_mock_macho)
+    errors.extend(discovery_errors)
+    discovered_paths = {relative for relative, _ in discovered_macho}
+    for relative in sorted(discovered_paths - expected):
+        errors.append(f"undeclared Mach-O object: {relative}")
+    for relative in sorted(expected - discovered_paths):
+        if not any(error.startswith(f"missing expected executable: {relative}") for error in errors):
+            errors.append(f"expected manifest executable is not a Mach-O object: {relative}")
 
     plist_path = app / "Contents/Info.plist"
     try:
@@ -260,9 +311,11 @@ def validate_bundle(
             continue
         if architecture != "arm64":
             errors.append(f"Mach-O architecture must be arm64: {relative} ({architecture})")
+        is_mock_macho = allow_mock_macho and mock_metadata(executable) is not None
         for dependency in dependencies:
+            load_command_contents = dependency if is_mock_macho else "\n".join(dependency.splitlines()[1:])
             for fragment in forbidden:
-                if fragment and fragment in dependency:
+                if fragment and fragment in load_command_contents:
                     errors.append(f"forbidden dependency or rpath string '{fragment}' in {relative}")
 
     return errors

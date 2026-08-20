@@ -52,6 +52,19 @@ final class IconFixtureTests: XCTestCase {
         )
     }
 
+    func testVerifierRejectsICNSRepresentationWithPixelsDifferentFromSipsMasterScale() throws {
+        let fixture = try makeICNSFixtureWithMismatched16PixelData()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let result = try runVerifier(master: repositoryMaster, icns: fixture.icns)
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(
+            result.stderr.contains("ICNS representation icon_16x16.png does not match master scaled with sips"),
+            "Expected pixel mismatch diagnostic, got: \(result.stderr)"
+        )
+    }
+
     private var repositoryRoot: URL {
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -97,6 +110,38 @@ final class IconFixtureTests: XCTestCase {
 
         let data = stderr.fileHandleForReading.readDataToEndOfFile()
         return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+    }
+
+    private func makeICNSFixtureWithMismatched16PixelData() throws -> (root: URL, icns: URL) {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LumiSyncIconMismatch-\(UUID().uuidString)", isDirectory: true)
+        let iconset = root.appendingPathComponent("LumiSync.iconset", isDirectory: true)
+        let sourceIconset = root.appendingPathComponent("Source.iconset", isDirectory: true)
+        let icns = root.appendingPathComponent("Mismatched.icns")
+
+        let extraction = Process()
+        extraction.executableURL = URL(fileURLWithPath: "/usr/bin/iconutil")
+        extraction.arguments = ["-c", "iconset", "-o", sourceIconset.path, repositoryICNS.path]
+        try extraction.run()
+        extraction.waitUntilExit()
+        XCTAssertEqual(extraction.terminationStatus, 0)
+        try FileManager.default.copyItem(at: sourceIconset, to: iconset)
+
+        let representation = iconset.appendingPathComponent("icon_16x16.png")
+        let mutate = Process()
+        mutate.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        mutate.arguments = ["-c", Self.pngPixelMutator, representation.path]
+        try mutate.run()
+        mutate.waitUntilExit()
+        XCTAssertEqual(mutate.terminationStatus, 0)
+
+        let packaging = Process()
+        packaging.executableURL = URL(fileURLWithPath: "/usr/bin/iconutil")
+        packaging.arguments = ["-c", "icns", "-o", icns.path, iconset.path]
+        try packaging.run()
+        packaging.waitUntilExit()
+        XCTAssertEqual(packaging.terminationStatus, 0)
+        return (root, icns)
     }
 
     private func makeICNSFixtureWithout512Representation() throws -> (root: URL, icns: URL) {
@@ -152,6 +197,38 @@ final class IconFixtureTests: XCTestCase {
         XCTAssertEqual(generator.terminationStatus, 0)
         return fixture
     }
+
+    private static let pngPixelMutator = #"""
+import binascii
+import struct
+import sys
+import zlib
+
+path = sys.argv[1]
+data = bytearray(open(path, "rb").read())
+signature = b"\x89PNG\r\n\x1a\n"
+offset = len(signature)
+chunks = []
+while offset < len(data):
+    length = struct.unpack_from(">I", data, offset)[0]
+    kind = bytes(data[offset + 4:offset + 8])
+    payload = bytes(data[offset + 8:offset + 8 + length])
+    chunks.append((kind, payload))
+    offset += length + 12
+idat = b"".join(payload for kind, payload in chunks if kind == b"IDAT")
+raw = bytearray(zlib.decompress(idat))
+raw[1:5] = bytes((255, 0, 255, 255))
+def chunk(kind, payload):
+    return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", binascii.crc32(kind + payload) & 0xffffffff)
+output = bytearray(signature)
+for kind, payload in chunks:
+    if kind == b"IDAT":
+        if payload == next(value for type_, value in chunks if type_ == b"IDAT"):
+            output.extend(chunk(kind, zlib.compress(raw)))
+        continue
+    output.extend(chunk(kind, payload))
+open(path, "wb").write(output)
+"""#
 
     private static let pngGenerator = #"""
 import binascii

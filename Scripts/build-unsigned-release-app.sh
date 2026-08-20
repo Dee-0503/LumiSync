@@ -11,10 +11,11 @@ readonly BUILD_NUMBER="${BUILD_NUMBER:-1}"
 readonly CONFIGURATION="${CONFIGURATION:-release}"
 readonly BUILD_DIR="${BUILD_DIR:-$REPO_ROOT/build}"
 readonly OUTPUT_DIR="$BUILD_DIR/unsigned-release"
+readonly SWIFTPM_BUILD_DIR="$BUILD_DIR/swiftpm"
 readonly APP_PATH="$OUTPUT_DIR/$APP_NAME.app"
 readonly INFO_PLIST_SOURCE="$REPO_ROOT/Packaging/LumiSync/Info.plist"
 readonly RESOURCES_SOURCE="$REPO_ROOT/Packaging/LumiSync/Resources"
-readonly MANIFEST="$REPO_ROOT/Packaging/LumiSync/NestedCode.json"
+readonly MANIFEST="${NESTED_CODE_MANIFEST:-$REPO_ROOT/Packaging/LumiSync/NestedCode.json}"
 readonly VERIFIER="$REPO_ROOT/Scripts/verify-release-bundle.py"
 
 if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
@@ -30,22 +31,40 @@ if [[ "$CONFIGURATION" != "release" ]]; then
   exit 2
 fi
 
-readonly PRODUCTS=(
-  "LumiSyncApp"
-  "lumisync-backlight-controller"
-  "lumisync-backlight-supervisor"
-  "lumisync-backlight-writer"
-)
+read_manifest_entries() {
+  python3 - "$MANIFEST" <<'PY'
+import json
+import sys
 
-for product in "${PRODUCTS[@]}"; do
+manifest_path = sys.argv[1]
+try:
+    document = json.load(open(manifest_path, encoding="utf-8"))
+    entries = document["executables"]
+except (OSError, ValueError, KeyError, TypeError) as error:
+    raise SystemExit(f"Cannot read nested-code manifest {manifest_path}: {error}")
+
+if not isinstance(entries, list) or not entries:
+    raise SystemExit(f"Nested-code manifest has no executable entries: {manifest_path}")
+for entry in entries:
+    if not isinstance(entry, dict) or set(entry) != {"path", "product", "role"}:
+        raise SystemExit(f"Nested-code manifest entry is invalid: {entry!r}")
+    if not all(isinstance(entry[key], str) and entry[key] for key in ("path", "product", "role")):
+        raise SystemExit(f"Nested-code manifest entry has an empty field: {entry!r}")
+    print("\t".join((entry["product"], entry["path"], entry["role"])))
+PY
+}
+
+while IFS=$'\t' read -r product destination role; do
   swift build \
     --package-path "$REPO_ROOT" \
+    --scratch-path "$SWIFTPM_BUILD_DIR" \
     --configuration "$CONFIGURATION" \
     --product "$product"
-done
+done < <(read_manifest_entries)
 
 bin_path="$(swift build \
   --package-path "$REPO_ROOT" \
+  --scratch-path "$SWIFTPM_BUILD_DIR" \
   --configuration "$CONFIGURATION" \
   --show-bin-path)"
 
@@ -68,14 +87,14 @@ copy_product() {
     echo "SwiftPM product is missing or not executable: $source" >&2
     exit 1
   fi
+  mkdir -p "$(dirname "$staged_app/$destination")"
   cp "$source" "$staged_app/$destination"
   chmod 755 "$staged_app/$destination"
 }
 
-copy_product "LumiSyncApp" "Contents/MacOS/LumiSync"
-copy_product "lumisync-backlight-controller" "Contents/Helpers/lumisync-backlight-controller"
-copy_product "lumisync-backlight-supervisor" "Contents/Helpers/lumisync-backlight-supervisor"
-copy_product "lumisync-backlight-writer" "Contents/Helpers/lumisync-backlight-writer"
+while IFS=$'\t' read -r product destination role; do
+  copy_product "$product" "$destination"
+done < <(read_manifest_entries)
 
 resource_bundle="$bin_path/LumiSync_LumiSyncAppSupport.bundle"
 if [[ ! -d "$resource_bundle" ]]; then

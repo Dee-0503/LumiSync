@@ -2,6 +2,11 @@ import Foundation
 import XCTest
 
 final class ReleaseBundleFixtureTests: XCTestCase {
+    private struct ManifestEntry {
+        let path: String
+        let product: String
+        let role: String
+    }
     func testBuilderProducesVerifiedUnsignedBundle() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ReleaseBundleBuilder-\(UUID().uuidString)", isDirectory: true)
@@ -211,6 +216,70 @@ final class ReleaseBundleFixtureTests: XCTestCase {
         XCTAssertTrue(result.output.contains("Mach-O architecture must be arm64: Contents/MacOS/LumiSync"), result.output)
     }
 
+    func testAcceptsDeclaredMachOObjectsNestedInAllSupportedBundleLocations() throws {
+        let nestedEntries = [
+            ManifestEntry(path: "Contents/Frameworks/Lumi.framework/Versions/A/Lumi", product: "LumiFramework", role: "framework"),
+            ManifestEntry(path: "Contents/PlugIns/Lumi.appex/Contents/MacOS/LumiExtension", product: "LumiExtension", role: "appex"),
+            ManifestEntry(path: "Contents/XPCServices/Lumi.xpc/Contents/MacOS/LumiXPC", product: "LumiXPC", role: "xpc"),
+            ManifestEntry(path: "Contents/Resources/Lumi.bundle/Contents/MacOS/LumiBundle", product: "LumiBundle", role: "bundle")
+        ]
+        let fixture = try makeValidFixture(manifest: manifestJSON(entries: validEntries + nestedEntries))
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        for path in nestedEntries.map(\.path) {
+            let executable = fixture.app.appendingPathComponent(path)
+            try FileManager.default.createDirectory(at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try writeExecutable(at: executable)
+        }
+
+        let result = try runVerifier(app: fixture.app, manifest: fixture.manifest)
+
+        XCTAssertEqual(result.status, 0, result.output)
+    }
+
+    func testRejectsUndeclaredMachOObjectNestedInPlugin() throws {
+        let fixture = try makeValidFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let executable = fixture.app.appendingPathComponent("Contents/PlugIns/Lumi.appex/Contents/MacOS/LumiExtension")
+        try FileManager.default.createDirectory(at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try writeExecutable(at: executable)
+
+        let result = try runVerifier(app: fixture.app, manifest: fixture.manifest)
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.contains("undeclared Mach-O object: Contents/PlugIns/Lumi.appex/Contents/MacOS/LumiExtension"), result.output)
+    }
+
+    func testBuilderStagesManifestDeclaredProductAtManifestPath() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ManifestDerivedBuilder-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let manifest = root.appendingPathComponent("NestedCode.json")
+        let relocatedController = "Contents/Helpers/Derived/lumisync-backlight-controller"
+        let entries = validEntries.map { entry in
+            entry.path == "Contents/Helpers/lumisync-backlight-controller"
+                ? ManifestEntry(path: relocatedController, product: entry.product, role: entry.role)
+                : entry
+        }
+        try manifestJSON(entries: entries).write(to: manifest, atomically: true, encoding: .utf8)
+
+        let buildDirectory = root.appendingPathComponent("build", isDirectory: true)
+        let result = try runBuilder(
+            buildDirectory: buildDirectory,
+            version: "0.2.0-dev",
+            buildNumber: "2",
+            manifest: manifest
+        )
+
+        XCTAssertEqual(result.status, 0, result.output)
+        let app = buildDirectory.appendingPathComponent("unsigned-release/LumiSync.app", isDirectory: true)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: app.appendingPathComponent(relocatedController).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: app.appendingPathComponent("Contents/Helpers/lumisync-backlight-controller").path))
+    }
+
     private var manifestScenarios: [(name: String, manifest: String, expectedError: String)] {
         [
             (
@@ -252,8 +321,8 @@ final class ReleaseBundleFixtureTests: XCTestCase {
         ]
     }
 
-    private func makeValidFixture() throws -> (root: URL, app: URL, manifest: URL) {
-        let fixture = try makeFixture()
+    private func makeValidFixture(manifest: String? = nil) throws -> (root: URL, app: URL, manifest: URL) {
+        let fixture = try makeFixture(manifest: manifest)
         let helpers = fixture.app.appendingPathComponent("Contents/Helpers", isDirectory: true)
         try FileManager.default.removeItem(at: helpers.appendingPathComponent("unexpected-helper"))
         try writeExecutable(at: helpers.appendingPathComponent("lumisync-backlight-writer"))
@@ -320,7 +389,8 @@ final class ReleaseBundleFixtureTests: XCTestCase {
     private func runBuilder(
         buildDirectory: URL,
         version: String,
-        buildNumber: String
+        buildNumber: String,
+        manifest: URL? = nil
     ) throws -> (status: Int32, output: String) {
         let process = Process()
         let output = Pipe()
@@ -333,7 +403,7 @@ final class ReleaseBundleFixtureTests: XCTestCase {
             "VERSION": version,
             "BUILD_NUMBER": buildNumber,
             "CONFIGURATION": "release"
-        ]) { _, override in override }
+        ].merging(manifest.map { ["NESTED_CODE_MANIFEST": $0.path] } ?? [:]) { _, override in override }) { _, override in override }
         process.standardOutput = output
         process.standardError = output
         try process.run()
@@ -383,17 +453,25 @@ final class ReleaseBundleFixtureTests: XCTestCase {
             .deletingLastPathComponent()
     }
 
+    private var validEntries: [ManifestEntry] {
+        [
+            ManifestEntry(path: "Contents/MacOS/LumiSync", product: "LumiSyncApp", role: "app"),
+            ManifestEntry(path: "Contents/Helpers/lumisync-backlight-controller", product: "lumisync-backlight-controller", role: "controller"),
+            ManifestEntry(path: "Contents/Helpers/lumisync-backlight-supervisor", product: "lumisync-backlight-supervisor", role: "supervisor"),
+            ManifestEntry(path: "Contents/Helpers/lumisync-backlight-writer", product: "lumisync-backlight-writer", role: "writer")
+        ]
+    }
+
     private var validManifest: String {
-        manifestJSON(entries: [
-            entry("Contents/MacOS/LumiSync", "LumiSyncApp", "app"),
-            entry("Contents/Helpers/lumisync-backlight-controller", "lumisync-backlight-controller", "controller"),
-            entry("Contents/Helpers/lumisync-backlight-supervisor", "lumisync-backlight-supervisor", "supervisor"),
-            entry("Contents/Helpers/lumisync-backlight-writer", "lumisync-backlight-writer", "writer")
-        ])
+        manifestJSON(entries: validEntries)
     }
 
     private func entry(_ path: String, _ product: String, _ role: String) -> String {
         "{\"path\":\"\(path)\",\"product\":\"\(product)\",\"role\":\"\(role)\"}"
+    }
+
+    private func manifestJSON(entries: [ManifestEntry]) -> String {
+        manifestJSON(entries: entries.map { entry($0.path, $0.product, $0.role) })
     }
 
     private func manifestJSON(entries: [String]) -> String {
