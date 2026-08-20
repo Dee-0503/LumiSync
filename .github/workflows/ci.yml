@@ -27,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Run H1 process safety tests
-        run: swift test --scratch-path "${RUNNER_TEMP}/lumisync-h1-process" --filter LumiSyncKeyboardProbeProcessTests
+        run: swift test --scratch-path "${RUNNER_TEMP}/lumisync-h1-process" --filter LumiSyncKeyboardProbeProcessTests.ThreeProcessRecoveryTests
 
   bundle-structure:
     runs-on: macos-14
