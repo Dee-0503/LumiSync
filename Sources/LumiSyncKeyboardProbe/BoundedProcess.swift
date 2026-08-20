@@ -174,16 +174,37 @@ internal final class DescendantProcessTracker: @unchecked Sendable {
 public actor BoundedOwnedProcessRunner: OwnedProcessRunning {
     fileprivate static let maximumOutputBytes = 64 * 1024
     private static let terminationGraceNanoseconds: UInt64 = 100_000_000
-    private static let pollNanoseconds: UInt64 = 5_000_000
+    fileprivate static let pollNanoseconds: UInt64 = 5_000_000
 
     public init() {}
 
     public func run(_ request: OwnedProcessRequest) async -> OwnedProcessResult {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: request.timeout)
         do {
             let process = try SpawnedProcess(request: request)
-            let clock = ContinuousClock()
-            let deadline = clock.now.advanced(by: request.timeout)
             var waitStatus: Int32 = 0
+            do {
+                try await process.writeAndCloseStandardInput(
+                    request.standardInput,
+                    deadline: deadline
+                )
+            } catch {
+                let cleanup = await terminateAndReap(process)
+                process.closeOutput()
+                let descendantsVerified = await process.cleanupVerified()
+                let cleanupVerified = cleanup.didReap && descendantsVerified
+                return OwnedProcessResult(
+                    termination: error is StandardInputWriteTimeout
+                        ? .timedOut
+                        : .failed(String(describing: error)),
+                    exitStatus: nil,
+                    stdout: Data(),
+                    stderr: Data(),
+                    rootPID: process.pid,
+                    cleanupVerified: cleanupVerified
+                )
+            }
             var termination: OwnedProcessTermination = .exited
             var didReap = false
 
@@ -234,16 +255,28 @@ public actor BoundedOwnedProcessRunner: OwnedProcessRunning {
 
             process.closeInput()
             let output: (stdout: Data, stderr: Data)
+            var outputCollectionFailed = false
             if termination == .timedOut {
                 process.closeOutput()
                 output = (Data(), Data())
             } else {
-                output = await process.collectOutput()
-                if process.outputLimitWasExceeded() {
+                let collection = await process.collectOutput(until: deadline)
+                process.closeOutput()
+                output = (collection.stdout, collection.stderr)
+                if let readError = collection.readError {
+                    termination = .failed(readError)
+                    outputCollectionFailed = true
+                } else if !collection.reachedEOF {
+                    termination = .failed("output did not reach EOF before deadline")
+                    outputCollectionFailed = true
+                } else if process.outputLimitWasExceeded() {
                     termination = .failed("output limit exceeded")
                 }
             }
-            let cleanupVerified = didReap && process.cleanupVerified()
+            let descendantsVerified = outputCollectionFailed
+                ? false
+                : await process.cleanupVerified()
+            let cleanupVerified = didReap && descendantsVerified
             return OwnedProcessResult(
                 termination: termination,
                 exitStatus: termination == .exited ? Self.exitStatus(for: waitStatus) : nil,
@@ -273,6 +306,42 @@ public actor BoundedOwnedProcessRunner: OwnedProcessRunning {
         }
     }
 
+    private func terminateAndReap(
+        _ process: SpawnedProcess
+    ) async -> (didReap: Bool, waitStatus: Int32) {
+        var waitStatus: Int32 = 0
+        process.closeInput()
+        process.refreshDescendants()
+        Self.terminateProcessGroup(process.groupID)
+        process.terminateKnownDescendants()
+        let clock = ContinuousClock()
+        let graceDeadline = clock.now.advanced(
+            by: .nanoseconds(Self.terminationGraceNanoseconds)
+        )
+        while clock.now < graceDeadline {
+            let result = waitpid(process.pid, &waitStatus, WNOHANG)
+            if result == process.pid {
+                return (true, waitStatus)
+            }
+            if result == -1 && errno != EINTR {
+                return (errno == ECHILD, waitStatus)
+            }
+            try? await Task.sleep(nanoseconds: Self.pollNanoseconds)
+        }
+        Self.killProcessGroup(process.groupID)
+        process.terminateKnownDescendants()
+        while true {
+            let result = waitpid(process.pid, &waitStatus, 0)
+            if result == process.pid {
+                return (true, waitStatus)
+            }
+            if result == -1 && errno == EINTR {
+                continue
+            }
+            return (result == -1 && errno == ECHILD, waitStatus)
+        }
+    }
+
     private static func termination(for status: Int32) -> OwnedProcessTermination {
         if status & 0x7f == 0 { return .exited }
         return .signaled(status & 0x7f)
@@ -297,6 +366,15 @@ public actor BoundedOwnedProcessRunner: OwnedProcessRunning {
     }
 
 }
+
+private struct OutputCollection {
+    let stdout: Data
+    let stderr: Data
+    let reachedEOF: Bool
+    let readError: String?
+}
+
+private struct StandardInputWriteTimeout: Error {}
 
 private enum SpawnedProcessError: Error, CustomStringConvertible {
     case spawn(Int32)
@@ -334,6 +412,9 @@ private final class SpawnedProcess: @unchecked Sendable {
     private var stdoutBuffer = Data()
     private var stderrBuffer = Data()
     private var outputLimitExceeded = false
+    private var stdoutReachedEOF = false
+    private var stderrReachedEOF = false
+    private var outputReadError: String?
     private let descendantTracker: DescendantProcessTracker
 
     init(request: OwnedProcessRequest) throws {
@@ -348,6 +429,16 @@ private final class SpawnedProcess: @unchecked Sendable {
             outputPipe.forEach { _ = close($0) }
             errorPipe.forEach { _ = close($0) }
             throw SpawnedProcessError.pipe(errno)
+        }
+        do {
+            try Self.makeNonblocking(outputPipe[0])
+            try Self.makeNonblocking(errorPipe[0])
+        } catch {
+            let code = errno
+            inputPipe.forEach { _ = close($0) }
+            outputPipe.forEach { _ = close($0) }
+            errorPipe.forEach { _ = close($0) }
+            throw SpawnedProcessError.pipe(code)
         }
 
         var actions: posix_spawn_file_actions_t?
@@ -450,45 +541,63 @@ private final class SpawnedProcess: @unchecked Sendable {
         error.readabilityHandler = { [weak self] handle in
             self?.consumeAvailableData(from: handle, isStdout: false)
         }
-        do {
-            try Self.writeStandardInput(request.standardInput, to: input.fileDescriptor)
-            closeInput()
-        } catch {
-            closeInput()
-            Self.terminateProcessGroup(groupID)
-            terminateKnownDescendants()
-            let didReap = Self.reap(pid)
-            closeOutput()
-            let cleanupVerified = didReap && cleanupVerified()
-            throw SpawnedProcessError.standardInput(
-                String(describing: error),
-                pid,
-                cleanupVerified
-            )
+    }
+
+    private static func makeNonblocking(_ descriptor: Int32) throws {
+        let flags = fcntl(descriptor, F_GETFL)
+        guard flags != -1,
+              fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) != -1 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
     }
 
-    private static func writeStandardInput(_ data: Data, to descriptor: Int32) throws {
+    func writeAndCloseStandardInput(
+        _ data: Data,
+        deadline: ContinuousClock.Instant
+    ) async throws {
+        defer { closeInput() }
+        let descriptor = input.fileDescriptor
         guard fcntl(descriptor, F_SETNOSIGPIPE, 1) != -1 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
+        let flags = fcntl(descriptor, F_GETFL)
+        guard flags != -1,
+              fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) != -1 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
 
-        try data.withUnsafeBytes { rawBuffer in
-            guard let baseAddress = rawBuffer.baseAddress else { return }
-            var offset = 0
-            while offset < rawBuffer.count {
-                let written = Darwin.write(
+        let clock = ContinuousClock()
+        var offset = 0
+        while offset < data.count {
+            guard clock.now < deadline else {
+                throw StandardInputWriteTimeout()
+            }
+            let written = data.withUnsafeBytes { rawBuffer -> Int in
+                guard let baseAddress = rawBuffer.baseAddress else { return 0 }
+                return Darwin.write(
                     descriptor,
                     baseAddress.advanced(by: offset),
                     rawBuffer.count - offset
                 )
-                if written > 0 {
-                    offset += written
-                    continue
-                }
-                if written == -1 && errno == EINTR { continue }
-                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
+            if written > 0 {
+                offset += written
+                continue
+            }
+            if written == -1 && errno == EINTR {
+                continue
+            }
+            if written == -1 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+                let remaining = clock.now.duration(to: deadline)
+                guard remaining > .zero else {
+                    throw StandardInputWriteTimeout()
+                }
+                try? await Task.sleep(
+                    for: min(remaining, .nanoseconds(BoundedOwnedProcessRunner.pollNanoseconds))
+                )
+                continue
+            }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
     }
 
@@ -518,7 +627,7 @@ private final class SpawnedProcess: @unchecked Sendable {
         try? error.close()
     }
 
-    func cleanupVerified() -> Bool {
+    func cleanupVerified() async -> Bool {
         let deadline = ContinuousClock.now.advanced(by: .seconds(2))
         while ContinuousClock.now < deadline {
             if descendantTracker.cleanupIsVerified(
@@ -527,7 +636,7 @@ private final class SpawnedProcess: @unchecked Sendable {
                 return true
             }
             descendantTracker.signalKnownDescendants(SIGKILL)
-            usleep(5_000)
+            try? await Task.sleep(nanoseconds: BoundedOwnedProcessRunner.pollNanoseconds)
         }
         return descendantTracker.cleanupIsVerified(
             groupIsGone: Self.descendantOperations.groupIsGone(groupID)
@@ -608,26 +717,79 @@ private final class SpawnedProcess: @unchecked Sendable {
         return .unavailable
     }
 
-    func collectOutput() async -> (stdout: Data, stderr: Data) {
-        collectOutputSynchronously()
-    }
-
-    private func collectOutputSynchronously() -> (stdout: Data, stderr: Data) {
+    func collectOutput(
+        until deadline: ContinuousClock.Instant
+    ) async -> OutputCollection {
         output.readabilityHandler = nil
         error.readabilityHandler = nil
-        consumeAvailableData(from: output, isStdout: true)
-        consumeAvailableData(from: error, isStdout: false)
+        let clock = ContinuousClock()
+        while true {
+            consumeAvailableData(from: output, isStdout: true)
+            consumeAvailableData(from: error, isStdout: false)
+            let snapshot = outputSnapshot()
+            if snapshot.reachedEOF || snapshot.readError != nil || clock.now >= deadline {
+                return snapshot
+            }
+            let remaining = clock.now.duration(to: deadline)
+            try? await Task.sleep(
+                for: min(
+                    remaining,
+                    .nanoseconds(BoundedOwnedProcessRunner.pollNanoseconds)
+                )
+            )
+        }
+    }
+
+    private func outputSnapshot() -> OutputCollection {
         outputLock.lock()
         defer { outputLock.unlock() }
-        return (stdoutBuffer, stderrBuffer)
+        return OutputCollection(
+            stdout: stdoutBuffer,
+            stderr: stderrBuffer,
+            reachedEOF: stdoutReachedEOF && stderrReachedEOF,
+            readError: outputReadError
+        )
     }
 
     private func consumeAvailableData(from handle: FileHandle, isStdout: Bool) {
-        let data = handle.availableData
-        guard !data.isEmpty else { return }
+        let descriptor = handle.fileDescriptor
+        var buffer = [UInt8](repeating: 0, count: 8_192)
+        while true {
+            let count = Darwin.read(descriptor, &buffer, buffer.count)
+            if count > 0 {
+                appendOutput(Data(buffer.prefix(count)), isStdout: isStdout)
+                continue
+            }
+            if count == 0 {
+                outputLock.lock()
+                if isStdout {
+                    stdoutReachedEOF = true
+                } else {
+                    stderrReachedEOF = true
+                }
+                outputLock.unlock()
+                return
+            }
+            if errno == EINTR {
+                continue
+            }
+            if errno == EAGAIN || errno == EWOULDBLOCK {
+                return
+            }
+            outputLock.lock()
+            if outputReadError == nil {
+                outputReadError = "output read failed with errno \(errno)"
+            }
+            outputLock.unlock()
+            return
+        }
+    }
+
+    private func appendOutput(_ data: Data, isStdout: Bool) {
         outputLock.lock()
         defer { outputLock.unlock() }
-        let remaining = Self.maximumOutputBytes - (isStdout ? stdoutBuffer.count : stderrBuffer.count)
+        let remaining = Self.maximumOutputBytes
+            - (isStdout ? stdoutBuffer.count : stderrBuffer.count)
         if data.count > remaining {
             outputLimitExceeded = true
         }

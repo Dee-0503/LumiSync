@@ -65,6 +65,26 @@ final class BoundedProcessTests: XCTestCase {
         XCTAssertTrue(waitUntilGone(pid))
     }
 
+    func testRunnerTimesOutWhileStandardInputIsBackpressured() async throws {
+        let started = ContinuousClock.now
+
+        let result = await runner.run(
+            fixture(
+                command: "sleep 2",
+                standardInput: Data(repeating: 0x61, count: 4 * 1_024 * 1_024),
+                timeout: .milliseconds(150)
+            )
+        )
+
+        let elapsed = started.duration(to: .now)
+        XCTAssertEqual(result.termination, .timedOut)
+        XCTAssertNil(result.exitStatus)
+        XCTAssertTrue(result.cleanupVerified)
+        let pid = try XCTUnwrap(result.rootPID)
+        XCTAssertTrue(waitUntilGone(pid))
+        XCTAssertLessThan(elapsed, .seconds(1))
+    }
+
     func testRunnerResetsInheritedIgnoredTerminationSignals() async {
         let previousINT = Darwin.signal(SIGINT, SIG_IGN)
         let previousTERM = Darwin.signal(SIGTERM, SIG_IGN)
@@ -130,6 +150,34 @@ final class BoundedProcessTests: XCTestCase {
         XCTAssertNotEqual(result.termination, .exited)
         XCTAssertTrue(result.cleanupVerified)
         XCTAssertTrue(FileManager.default.fileExists(atPath: pidFile.path))
+    }
+
+    func testRunnerFailsClosedWhenUnscannedSetsidDescendantKeepsOutputPipesOpen() async throws {
+        let pidFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lumisync-output-escape-\(UUID().uuidString).pid")
+        defer { try? FileManager.default.removeItem(at: pidFile) }
+        let command = "python3 -c 'import os,time; os.setsid(); pid=os.fork(); pid and os._exit(0); open(\"\(pidFile.path)\",\"w\").write(str(os.getpid())); time.sleep(30)' & while [ ! -s \(pidFile.path) ]; do sleep 0.01; done; exit 0"
+        let started = ContinuousClock.now
+
+        let result = await runner.run(
+            fixture(command: command, timeout: .milliseconds(250))
+        )
+
+        let elapsed = started.duration(to: .now)
+        let escapedPID = try XCTUnwrap(
+            Int32(try String(contentsOf: pidFile, encoding: .utf8))
+        )
+        defer {
+            _ = kill(escapedPID, SIGKILL)
+            _ = waitUntilGone(escapedPID)
+        }
+        XCTAssertEqual(
+            result.termination,
+            .failed("output did not reach EOF before deadline")
+        )
+        XCTAssertNil(result.exitStatus)
+        XCTAssertFalse(result.cleanupVerified)
+        XCTAssertLessThan(elapsed, .seconds(1))
     }
 
     func testDescendantCleanupDoesNotSignalPIDWhenIdentityCheckDetectsReuse() {
