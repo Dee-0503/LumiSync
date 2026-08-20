@@ -328,12 +328,12 @@ final class ReleaseBundleFixtureTests: XCTestCase {
         process.arguments = [
             repositoryRoot.appendingPathComponent("Scripts/build-unsigned-release-app.sh").path
         ]
-        process.environment = [
+        process.environment = ProcessInfo.processInfo.environment.merging([
             "BUILD_DIR": buildDirectory.path,
             "VERSION": version,
             "BUILD_NUMBER": buildNumber,
             "CONFIGURATION": "release"
-        ]
+        ]) { _, override in override }
         process.standardOutput = output
         process.standardError = output
         try process.run()
